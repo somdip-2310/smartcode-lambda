@@ -234,30 +234,55 @@ public class BedrockAnalysisLambda implements RequestHandler<SQSEvent, Void> {
             // Try to extract JSON from the response if it contains extra text
             String cleaned = result.trim();
             
-            // Remove common markdown code blocks if present
-            if (cleaned.startsWith("```json")) {
-                cleaned = cleaned.substring(7);
-            } else if (cleaned.startsWith("```")) {
-                cleaned = cleaned.substring(3);
+            // Remove markdown code blocks more robustly
+            if (cleaned.contains("```json")) {
+                int startIndex = cleaned.indexOf("```json") + 7;
+                int endIndex = cleaned.lastIndexOf("```");
+                if (endIndex > startIndex) {
+                    cleaned = cleaned.substring(startIndex, endIndex).trim();
+                }
+            } else if (cleaned.contains("```")) {
+                int startIndex = cleaned.indexOf("```") + 3;
+                int endIndex = cleaned.lastIndexOf("```");
+                if (endIndex > startIndex) {
+                    cleaned = cleaned.substring(startIndex, endIndex).trim();
+                }
             }
             
-            if (cleaned.endsWith("```")) {
-                cleaned = cleaned.substring(0, cleaned.length() - 3);
-            }
-            
+            // Remove any leading/trailing whitespace or newlines
             cleaned = cleaned.trim();
+            
+            // Additional cleaning - remove any non-JSON characters at the beginning
+            while (cleaned.length() > 0 && cleaned.charAt(0) != '{' && cleaned.charAt(0) != '[') {
+                cleaned = cleaned.substring(1);
+            }
             
             try {
                 return objectMapper.readValue(cleaned, Map.class);
             } catch (Exception e2) {
-                context.getLogger().log("Still failed to parse after cleaning: " + e2.getMessage());
+                context.getLogger().log("Still failed to parse after cleaning. Original: " + result);
+                context.getLogger().log("Cleaned: " + cleaned);
+                context.getLogger().log("Error: " + e2.getMessage());
+                
                 // Return a default structure
                 Map<String, Object> defaultResult = new HashMap<>();
                 defaultResult.put("summary", "Analysis completed but result parsing failed");
                 defaultResult.put("overallScore", 5.0);
                 defaultResult.put("issues", new ArrayList<>());
                 defaultResult.put("suggestions", new ArrayList<>());
-                defaultResult.put("rawResponse", result);
+                
+                Map<String, Object> security = new HashMap<>();
+                security.put("securityScore", 5.0);
+                security.put("vulnerabilities", new ArrayList<>());
+                security.put("hasSecurityIssues", false);
+                defaultResult.put("security", security);
+                
+                Map<String, Object> performance = new HashMap<>();
+                performance.put("performanceScore", 5.0);
+                performance.put("bottlenecks", new ArrayList<>());
+                performance.put("complexity", "Unknown");
+                defaultResult.put("performance", performance);
+                
                 return defaultResult;
             }
         }
@@ -366,7 +391,9 @@ public class BedrockAnalysisLambda implements RequestHandler<SQSEvent, Void> {
             4. Best practices
             5. Potential bugs
             
-            Provide your response in JSON format with this structure:
+            CRITICAL: Your response must be ONLY the JSON object below, with NO additional text, NO markdown formatting, NO code blocks, and NO backticks.
+            
+            Return this exact JSON structure:
             {
               "summary": "Brief overview",
               "overallScore": 8.5,
@@ -396,13 +423,12 @@ public class BedrockAnalysisLambda implements RequestHandler<SQSEvent, Void> {
               }
             }
             
-            Code:
-            ```%s
+            Code to analyze:
             %s
-            ```
             
-            Respond with ONLY valid JSON without any markdown formatting or code blocks. Do not include ``` or ```json tags.
-            """, language, language, code);
+            Remember: Return ONLY the JSON object, nothing else.
+            """, language, code);
+    
     }
     
     private String buildChunkAnalysisPrompt(String code, String language, int chunkNumber, int totalChunks) {
