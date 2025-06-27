@@ -273,7 +273,7 @@ public class BedrockAnalysisLambda implements RequestHandler<SQSEvent, Void> {
             %s
             ```
             
-            Respond with valid JSON only.
+            Respond with ONLY valid JSON without any markdown formatting or code blocks. Do not include ``` or ```json tags.
             """, language, language, code);
     }
     
