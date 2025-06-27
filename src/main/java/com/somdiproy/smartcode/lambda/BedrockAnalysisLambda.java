@@ -37,17 +37,32 @@ public class BedrockAnalysisLambda implements RequestHandler<SQSEvent, Void> {
     private final ObjectMapper objectMapper;
     
     public BedrockAnalysisLambda() {
-        this.bedrockClient = BedrockRuntimeClient.builder()
-                .region(Region.US_EAST_1)
-                .credentialsProvider(DefaultCredentialsProvider.create())
-                .build();
-        
-        this.dynamoDBClient = AmazonDynamoDBClientBuilder.standard().build();
-        this.dynamoDB = new DynamoDB(dynamoDBClient);
-        this.analysisTable = dynamoDB.getTable(TABLE_NAME != null ? TABLE_NAME : "code-analysis-results");
-        
-        this.s3Client = AmazonS3ClientBuilder.standard().build();
-        this.objectMapper = new ObjectMapper();
+        // Initialize clients with proper error handling
+        try {
+            this.bedrockClient = BedrockRuntimeClient.builder()
+                    .region(Region.US_EAST_1)
+                    .credentialsProvider(DefaultCredentialsProvider.create())
+                    .build();
+            
+            this.dynamoDBClient = AmazonDynamoDBClientBuilder.standard().build();
+            this.dynamoDB = new DynamoDB(dynamoDBClient);
+            
+            // Use default table name if environment variable is not set
+            String tableName = TABLE_NAME != null ? TABLE_NAME : "code-analysis-results";
+            this.analysisTable = dynamoDB.getTable(tableName);
+            
+            this.s3Client = AmazonS3ClientBuilder.standard().build();
+            this.objectMapper = new ObjectMapper();
+            
+            // Log initialization
+            System.out.println("Lambda initialized with table: " + tableName);
+            System.out.println("S3 bucket: " + (BUCKET_NAME != null ? BUCKET_NAME : "not set"));
+            System.out.println("Model ID: " + (MODEL_ID != null ? MODEL_ID : "using default"));
+        } catch (Exception e) {
+            System.err.println("Error initializing Lambda: " + e.getMessage());
+            e.printStackTrace();
+            throw new RuntimeException("Failed to initialize Lambda", e);
+        }
     }
     
     @Override
@@ -55,17 +70,23 @@ public class BedrockAnalysisLambda implements RequestHandler<SQSEvent, Void> {
         context.getLogger().log("Processing " + event.getRecords().size() + " messages");
         
         for (SQSEvent.SQSMessage message : event.getRecords()) {
+            String analysisId = null;
             try {
+                analysisId = extractAnalysisId(message);
+                context.getLogger().log("Processing analysis: " + analysisId);
                 processMessage(message, context);
             } catch (Exception e) {
-                context.getLogger().log("Error processing message: " + e.getMessage());
+                context.getLogger().log("ERROR processing message: " + e.getMessage());
+                e.printStackTrace();
+                
                 // Update status to FAILED in DynamoDB
-                String analysisId = extractAnalysisId(message);
                 if (analysisId != null) {
                     updateAnalysisStatus(analysisId, "FAILED", e.getMessage(), null);
                 }
-                // Rethrow to let SQS retry if configured
-                throw new RuntimeException("Failed to process message", e);
+                
+                // Don't rethrow to prevent infinite retries for permanent failures
+                // Log the error and continue with next message
+                context.getLogger().log("Marking message as processed to prevent infinite retries");
             }
         }
         return null;
@@ -96,6 +117,11 @@ public class BedrockAnalysisLambda implements RequestHandler<SQSEvent, Void> {
             String language = (String) messageBody.get("language");
             String codeLocation = (String) messageBody.get("codeLocation");
             
+            // Validate required fields
+            if (analysisId == null || analysisId.isEmpty()) {
+                throw new IllegalArgumentException("analysisId is required");
+            }
+            
             context.getLogger().log("Analysis ID: " + analysisId + ", Language: " + language + ", Code Location: " + codeLocation);
             
             // Update status to PROCESSING
@@ -105,16 +131,22 @@ public class BedrockAnalysisLambda implements RequestHandler<SQSEvent, Void> {
             String code;
             if ("s3".equals(codeLocation)) {
                 String s3Key = (String) messageBody.get("s3Key");
+                if (s3Key == null || s3Key.isEmpty()) {
+                    throw new IllegalArgumentException("s3Key is required when codeLocation is 's3'");
+                }
+                
                 context.getLogger().log("Fetching code from S3: " + BUCKET_NAME + "/" + s3Key);
                 
                 try {
-                    code = s3Client.getObjectAsString(BUCKET_NAME, s3Key);
+                    // Validate bucket name
+                    String bucketName = BUCKET_NAME != null ? BUCKET_NAME : "smartcode-uploads";
+                    code = s3Client.getObjectAsString(bucketName, s3Key);
                     context.getLogger().log("Successfully retrieved code from S3, length: " + code.length());
                 } catch (Exception e) {
-                    context.getLogger().log("Failed to retrieve from S3, checking if code is inline: " + e.getMessage());
+                    context.getLogger().log("Failed to retrieve from S3: " + e.getMessage());
                     
                     // Fallback: check if code is also provided inline
-                    if (messageBody.containsKey("code")) {
+                    if (messageBody.containsKey("code") && messageBody.get("code") != null) {
                         code = (String) messageBody.get("code");
                         context.getLogger().log("Using inline code as fallback, length: " + code.length());
                     } else {
@@ -127,6 +159,11 @@ public class BedrockAnalysisLambda implements RequestHandler<SQSEvent, Void> {
                     throw new RuntimeException("No code content found in message");
                 }
                 context.getLogger().log("Using inline code, length: " + code.length());
+            }
+            
+            // Validate code content
+            if (code.trim().isEmpty()) {
+                throw new IllegalArgumentException("Code content is empty");
             }
             
             // Process based on size
