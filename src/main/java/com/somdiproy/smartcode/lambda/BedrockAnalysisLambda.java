@@ -72,29 +72,65 @@ public class BedrockAnalysisLambda implements RequestHandler<SQSEvent, Void> {
     private void processMessage(SQSEvent.SQSMessage message, Context context) throws Exception {
         context.getLogger().log("Processing message: " + message.getMessageId());
         
-        // Parse message body
-        Map<String, Object> messageBody = objectMapper.readValue(message.getBody(), Map.class);
-        String analysisId = (String) messageBody.get("analysisId");
-        String language = (String) messageBody.get("language");
-        String codeLocation = (String) messageBody.get("codeLocation");
-        
-        // Update status to PROCESSING
-        updateAnalysisStatus(analysisId, "PROCESSING", "Analysis in progress", null);
-        
-        // Get code content
-        String code;
-        if ("s3".equals(codeLocation)) {
-            String s3Key = (String) messageBody.get("s3Key");
-            code = s3Client.getObjectAsString(BUCKET_NAME, s3Key);
-        } else {
-            code = (String) messageBody.get("code");
-        }
-        
-        // Process based on size
-        if (code.length() > MAX_CHUNK_SIZE) {
-            processInChunks(analysisId, code, language, context);
-        } else {
-            processSingleAnalysis(analysisId, code, language, context);
+        String analysisId = null;
+        try {
+            // Parse message body
+            Map<String, Object> messageBody = objectMapper.readValue(message.getBody(), Map.class);
+            analysisId = (String) messageBody.get("analysisId");
+            String language = (String) messageBody.get("language");
+            String codeLocation = (String) messageBody.get("codeLocation");
+            
+            context.getLogger().log("Analysis ID: " + analysisId + ", Language: " + language + ", Code Location: " + codeLocation);
+            
+            // Update status to PROCESSING
+            updateAnalysisStatus(analysisId, "PROCESSING", "Analysis in progress", null);
+            
+            // Get code content
+            String code;
+            if ("s3".equals(codeLocation)) {
+                String s3Key = (String) messageBody.get("s3Key");
+                context.getLogger().log("Fetching code from S3: " + BUCKET_NAME + "/" + s3Key);
+                
+                try {
+                    code = s3Client.getObjectAsString(BUCKET_NAME, s3Key);
+                    context.getLogger().log("Successfully retrieved code from S3, length: " + code.length());
+                } catch (Exception e) {
+                    context.getLogger().log("Failed to retrieve from S3, checking if code is inline: " + e.getMessage());
+                    
+                    // Fallback: check if code is also provided inline
+                    if (messageBody.containsKey("code")) {
+                        code = (String) messageBody.get("code");
+                        context.getLogger().log("Using inline code as fallback, length: " + code.length());
+                    } else {
+                        throw new RuntimeException("Failed to retrieve code from S3 and no inline code provided", e);
+                    }
+                }
+            } else {
+                code = (String) messageBody.get("code");
+                if (code == null || code.isEmpty()) {
+                    throw new RuntimeException("No code content found in message");
+                }
+                context.getLogger().log("Using inline code, length: " + code.length());
+            }
+            
+            // Process based on size
+            if (code.length() > MAX_CHUNK_SIZE) {
+                processInChunks(analysisId, code, language, context);
+            } else {
+                processSingleAnalysis(analysisId, code, language, context);
+            }
+            
+        } catch (Exception e) {
+            context.getLogger().log("Error processing message: " + e.getMessage());
+            e.printStackTrace();
+            
+            // Update status to FAILED in DynamoDB
+            if (analysisId != null) {
+                updateAnalysisStatus(analysisId, "FAILED", "Error: " + e.getMessage(), null);
+            }
+            
+            // Rethrow to let SQS retry if configured
+            throw new RuntimeException("Failed to process message", e);
         }
     }
     
