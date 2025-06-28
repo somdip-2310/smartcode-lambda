@@ -79,7 +79,7 @@ public class BedrockAnalysisLambda implements RequestHandler<SQSEvent, Void> {
                 
                 // Update status to FAILED in DynamoDB
                 if (analysisId != null) {
-                    updateAnalysisStatus(analysisId, "FAILED", "Processing failed: " + e.getMessage(), null);
+                    updateAnalysisStatus(analysisId, "FAILED", "Processing failed: " + e.getMessage(), null, null);
                 }
                 
                 // Rethrow to let SQS retry if configured
@@ -98,8 +98,14 @@ public class BedrockAnalysisLambda implements RequestHandler<SQSEvent, Void> {
         String language = (String) messageBody.get("language");
         String codeLocation = (String) messageBody.get("codeLocation");
         
+        // Extract metadata if present
+        Map<String, Object> metadata = null;
+        if (messageBody.containsKey("metadata")) {
+            metadata = (Map<String, Object>) messageBody.get("metadata");
+        }
+        
         // Update status to PROCESSING
-        updateAnalysisStatus(analysisId, "PROCESSING", "Analysis in progress", null);
+        updateAnalysisStatus(analysisId, "PROCESSING", "Analysis in progress", null, metadata);
         
         // Get code content
         String code;
@@ -112,13 +118,13 @@ public class BedrockAnalysisLambda implements RequestHandler<SQSEvent, Void> {
         
         // Process based on size
         if (code.length() > MAX_CHUNK_SIZE) {
-            processInChunks(analysisId, code, language, context);
+            processInChunks(analysisId, code, language, context, metadata);
         } else {
-            processSingleAnalysis(analysisId, code, language, context);
+            processSingleAnalysis(analysisId, code, language, context, metadata);
         }
     }
     
-    private void processSingleAnalysis(String analysisId, String code, String language, Context context) throws Exception {
+    private void processSingleAnalysis(String analysisId, String code, String language, Context context, Map<String, Object> metadata) throws Exception {
         context.getLogger().log("Processing single analysis for " + analysisId);
         
         String prompt = buildAnalysisPrompt(code, language);
@@ -127,13 +133,18 @@ public class BedrockAnalysisLambda implements RequestHandler<SQSEvent, Void> {
         // Parse result and add quality metrics
         Map<String, Object> analysisResult = parseAnalysisResult(result, context);
         
+        // Add metadata if provided
+        if (metadata != null && !analysisResult.containsKey("metadata")) {
+            analysisResult.put("metadata", metadata);
+        }
+        
         // Ensure quality metrics are populated
         ensureQualityMetrics(analysisResult, code);
         
-        updateAnalysisStatus(analysisId, "COMPLETED", "Analysis completed successfully", analysisResult);
+        updateAnalysisStatus(analysisId, "COMPLETED", "Analysis completed successfully", analysisResult, metadata);
     }
     
-    private void processInChunks(String analysisId, String code, String language, Context context) throws Exception {
+    private void processInChunks(String analysisId, String code, String language, Context context, Map<String, Object> metadata) throws Exception {
         context.getLogger().log("Processing in chunks for " + analysisId + ", code length: " + code.length());
         
         List<String> chunks = splitIntoChunks(code, MAX_CHUNK_SIZE);
@@ -156,7 +167,13 @@ public class BedrockAnalysisLambda implements RequestHandler<SQSEvent, Void> {
         
         // Merge results with original code for quality metrics
         Map<String, Object> mergedResult = mergeChunkResults(chunkResults, code);
-        updateAnalysisStatus(analysisId, "COMPLETED", "Analysis completed successfully", mergedResult);
+        
+        // Add metadata if provided
+        if (metadata != null && !mergedResult.containsKey("metadata")) {
+            mergedResult.put("metadata", metadata);
+        }
+        
+        updateAnalysisStatus(analysisId, "COMPLETED", "Analysis completed successfully", mergedResult, metadata);
     }
     
     private String invokeBedrockWithRetry(String prompt, Context context) throws Exception {
@@ -370,6 +387,7 @@ public class BedrockAnalysisLambda implements RequestHandler<SQSEvent, Void> {
         quality.put("complexityScore", 5);
         quality.put("testCoverage", 0.0);
         quality.put("duplicateLines", 0);
+        quality.put("technicalDebt", "Medium");
         result.put("quality", quality);
         
         return result;
@@ -406,6 +424,18 @@ public class BedrockAnalysisLambda implements RequestHandler<SQSEvent, Void> {
         
         if (!quality.containsKey("duplicateLines")) {
             quality.put("duplicateLines", 0);
+        }
+        
+        if (!quality.containsKey("technicalDebt")) {
+            quality.put("technicalDebt", "Low");
+        }
+        
+        // Ensure metadata exists
+        if (!result.containsKey("metadata")) {
+            Map<String, Object> metadata = new HashMap<>();
+            metadata.put("analysisTimestamp", new Date().toString());
+            metadata.put("lambdaProcessed", true);
+            result.put("metadata", metadata);
         }
     }
     
@@ -506,6 +536,7 @@ public class BedrockAnalysisLambda implements RequestHandler<SQSEvent, Void> {
         mergedQuality.put("complexityScore", 5);
         mergedQuality.put("testCoverage", 0.0);
         mergedQuality.put("duplicateLines", 0);
+        mergedQuality.put("technicalDebt", "Low");
         merged.put("quality", mergedQuality);
         
         return merged;
@@ -604,7 +635,8 @@ public class BedrockAnalysisLambda implements RequestHandler<SQSEvent, Void> {
                 "linesOfCode": %d,
                 "complexityScore": 5,
                 "testCoverage": 0.0,
-                "duplicateLines": 0
+                "duplicateLines": 0,
+                "technicalDebt": "Low"
               }
             }
             
@@ -641,8 +673,27 @@ public class BedrockAnalysisLambda implements RequestHandler<SQSEvent, Void> {
         );
     }
     
-    private void updateAnalysisStatus(String analysisId, String status, String message, Map<String, Object> result) {
+    private void updateAnalysisStatus(String analysisId, String status, String message, Map<String, Object> result, Map<String, Object> metadata) {
         try {
+            // Preserve existing metadata when updating
+            if (result != null && status.equals("COMPLETED")) {
+                try {
+                    // Get existing item to preserve metadata
+                    Item existingItem = analysisTable.getItem("analysisId", analysisId);
+                    if (existingItem != null && existingItem.hasAttribute("resultJson")) {
+                        String existingResultJson = existingItem.getString("resultJson");
+                        Map<String, Object> existingResult = objectMapper.readValue(existingResultJson, Map.class);
+                        
+                        // If existing result has metadata and new result doesn't, preserve it
+                        if (existingResult.containsKey("metadata") && !result.containsKey("metadata")) {
+                            result.put("metadata", existingResult.get("metadata"));
+                        }
+                    }
+                } catch (Exception e) {
+                    System.err.println("Could not preserve existing metadata: " + e.getMessage());
+                }
+            }
+            
             Item item = new Item()
                 .withPrimaryKey("analysisId", analysisId)
                 .withString("status", status)
