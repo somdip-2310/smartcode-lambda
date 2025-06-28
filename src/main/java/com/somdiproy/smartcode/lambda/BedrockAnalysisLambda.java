@@ -217,16 +217,43 @@ public class BedrockAnalysisLambda implements RequestHandler<SQSEvent, Void> {
             }
             
         } catch (Exception e) {
-            context.getLogger().log("Error processing message: " + e.getMessage());
+            String detailedError = String.format("Error processing message: %s - %s", 
+                e.getClass().getSimpleName(), e.getMessage());
+            context.getLogger().log(detailedError);
             e.printStackTrace();
             
-            // Update status to FAILED in DynamoDB
-            if (analysisId != null) {
-                updateAnalysisStatus(analysisId, "FAILED", "Error: " + e.getMessage(), null);
+            // Create a more informative error message
+            String userFriendlyError = "Analysis failed";
+            
+            if (e.getMessage() != null) {
+                if (e.getMessage().contains("parse") || e.getMessage().contains("JSON")) {
+                    userFriendlyError = "Failed to parse AI response. Please try again.";
+                } else if (e.getMessage().contains("throttl") || e.getMessage().contains("429")) {
+                    userFriendlyError = "AI service is busy. Please try again in a few moments.";
+                } else if (e.getMessage().contains("timeout")) {
+                    userFriendlyError = "Analysis timed out. Try with smaller code size.";
+                } else {
+                    userFriendlyError = "Analysis error: " + e.getMessage();
+                }
             }
             
-            // Rethrow to let SQS retry if configured
-            throw new RuntimeException("Failed to process message", e);
+            // Update status to FAILED in DynamoDB with detailed error
+            if (analysisId != null) {
+                updateAnalysisStatus(analysisId, "FAILED", userFriendlyError, null);
+            }
+            
+            // For transient errors, allow retry
+            boolean isTransientError = e.getMessage() != null && 
+                (e.getMessage().contains("throttl") || 
+                 e.getMessage().contains("429") || 
+                 e.getMessage().contains("timeout"));
+            
+            if (isTransientError) {
+                throw new RuntimeException("Transient failure: " + userFriendlyError, e);
+            }
+            
+            // For permanent errors, don't retry
+            context.getLogger().log("Permanent failure detected, not retrying");
         }
     }
     
@@ -292,15 +319,27 @@ public class BedrockAnalysisLambda implements RequestHandler<SQSEvent, Void> {
     
     private Map<String, Object> parseAnalysisResult(String result, Context context) throws Exception {
         try {
-            // First try to parse as JSON
-            return objectMapper.readValue(result, Map.class);
-        } catch (Exception e) {
-            context.getLogger().log("Failed to parse result as JSON, attempting to clean: " + e.getMessage());
+            // Log the raw result for debugging
+            context.getLogger().log("Raw Bedrock response length: " + (result != null ? result.length() : "null"));
+            
+            if (result == null || result.trim().isEmpty()) {
+                context.getLogger().log("WARNING: Empty or null response from Bedrock");
+                return createDefaultAnalysisResult();
+            }
+            
+            // First try to parse as JSON directly
+            try {
+                Map<String, Object> parsed = objectMapper.readValue(result, Map.class);
+                context.getLogger().log("Successfully parsed JSON response");
+                return validateAndNormalizeResult(parsed);
+            } catch (Exception e) {
+                context.getLogger().log("Initial JSON parse failed: " + e.getMessage());
+            }
             
             // Try to extract JSON from the response
             String cleaned = result.trim();
             
-            // Remove markdown code blocks
+            // Remove markdown code blocks if present
             if (cleaned.contains("```json")) {
                 int startIndex = cleaned.indexOf("```json") + 7;
                 int endIndex = cleaned.lastIndexOf("```");
@@ -308,25 +347,90 @@ public class BedrockAnalysisLambda implements RequestHandler<SQSEvent, Void> {
                     cleaned = cleaned.substring(startIndex, endIndex).trim();
                 }
             } else if (cleaned.contains("```")) {
-                cleaned = cleaned.replaceFirst("```[a-zA-Z]*\\n?", "").replaceAll("```\\s*$", "").trim();
+                // Remove any code block markers
+                cleaned = cleaned.replaceAll("```[a-zA-Z]*\\s*", "").replaceAll("\\s*```", "").trim();
             }
             
             // Find JSON object boundaries
             int jsonStart = cleaned.indexOf('{');
-            int jsonEnd = cleaned.lastIndexOf('}');
+            int jsonEnd = findMatchingBrace(cleaned, jsonStart);
             
             if (jsonStart >= 0 && jsonEnd > jsonStart) {
                 cleaned = cleaned.substring(jsonStart, jsonEnd + 1);
+                
+                try {
+                    Map<String, Object> parsed = objectMapper.readValue(cleaned, Map.class);
+                    context.getLogger().log("Successfully parsed cleaned JSON response");
+                    return validateAndNormalizeResult(parsed);
+                } catch (Exception e2) {
+                    context.getLogger().log("Failed to parse cleaned JSON: " + e2.getMessage());
+                    // Log first 500 chars of cleaned response for debugging
+                    context.getLogger().log("Cleaned response preview: " + 
+                        cleaned.substring(0, Math.min(cleaned.length(), 500)));
+                }
             }
             
-            try {
-                return objectMapper.readValue(cleaned, Map.class);
-            } catch (Exception e2) {
-                context.getLogger().log("Failed to parse cleaned JSON: " + cleaned);
-                // Return a valid default structure
-                return createDefaultAnalysisResult();
+            // If all parsing attempts fail, create a valid default structure
+            context.getLogger().log("All parsing attempts failed, returning default structure");
+            return createDefaultAnalysisResult();
+            
+        } catch (Exception e) {
+            context.getLogger().log("ERROR in parseAnalysisResult: " + e.getMessage());
+            e.printStackTrace();
+            return createDefaultAnalysisResult();
+        }
+    }
+
+    private int findMatchingBrace(String str, int startIndex) {
+        if (startIndex < 0 || startIndex >= str.length() || str.charAt(startIndex) != '{') {
+            return -1;
+        }
+        
+        int count = 0;
+        boolean inString = false;
+        boolean escaped = false;
+        
+        for (int i = startIndex; i < str.length(); i++) {
+            char c = str.charAt(i);
+            
+            if (!escaped) {
+                if (c == '"' && !inString) {
+                    inString = true;
+                } else if (c == '"' && inString) {
+                    inString = false;
+                } else if (!inString) {
+                    if (c == '{') count++;
+                    else if (c == '}') {
+                        count--;
+                        if (count == 0) return i;
+                    }
+                }
+                
+                escaped = (c == '\\' && inString);
+            } else {
+                escaped = false;
             }
         }
+        
+        return -1;
+    }
+
+    private Map<String, Object> validateAndNormalizeResult(Map<String, Object> result) {
+        // Ensure all required fields are present
+        if (!result.containsKey("summary")) {
+            result.put("summary", "Code analysis completed");
+        }
+        if (!result.containsKey("overallScore")) {
+            result.put("overallScore", 7.0);
+        }
+        if (!result.containsKey("issues") || !(result.get("issues") instanceof List)) {
+            result.put("issues", new ArrayList<>());
+        }
+        if (!result.containsKey("improvements") || !(result.get("improvements") instanceof List)) {
+            result.put("improvements", new ArrayList<>());
+        }
+        
+        return result;
     }
 
     private Map<String, Object> createDefaultAnalysisResult() {
@@ -638,27 +742,35 @@ public class BedrockAnalysisLambda implements RequestHandler<SQSEvent, Void> {
             Item item = new Item()
                 .withPrimaryKey("analysisId", analysisId)
                 .withString("status", status)
-                .withString("message", message)
+                .withString("message", message != null ? message : "Status updated")
                 .withLong("timestamp", System.currentTimeMillis())
-                .withLong("ttl", System.currentTimeMillis() / 1000 + TimeUnit.DAYS.toSeconds(7)); // 7 days TTL
+                .withLong("ttl", System.currentTimeMillis() / 1000 + TimeUnit.DAYS.toSeconds(7));
             
             if (result != null) {
-                // CRITICAL FIX: Store as "resultJson" instead of "result"
-                // This matches what the Spring application expects
-                String resultJsonString = objectMapper.writeValueAsString(result);
-                item.withString("resultJson", resultJsonString);
-                
-                // Also log the size for debugging
-                System.out.println("Storing resultJson for " + analysisId + ", size: " + resultJsonString.length() + " bytes");
+                try {
+                    // Store as resultJson to match what the application expects
+                    String resultJson = objectMapper.writeValueAsString(result);
+                    item.withString("resultJson", resultJson);
+                    
+                    // Also store as 'result' for backward compatibility
+                    item.withJSON("result", resultJson);
+                } catch (Exception e) {
+                    System.err.println("Failed to serialize result: " + e.getMessage());
+                    // Store error info instead
+                    Map<String, Object> errorResult = new HashMap<>();
+                    errorResult.put("error", "Failed to serialize analysis result");
+                    errorResult.put("message", e.getMessage());
+                    item.withJSON("result", objectMapper.writeValueAsString(errorResult));
+                }
             }
             
             analysisTable.putItem(item);
-            System.out.println("Successfully updated DynamoDB - Analysis ID: " + analysisId + ", Status: " + status);
+            System.out.println("Updated DynamoDB - Analysis ID: " + analysisId + ", Status: " + status);
             
         } catch (Exception e) {
-            // Log error but don't fail the Lambda
             System.err.println("Failed to update DynamoDB: " + e.getMessage());
             e.printStackTrace();
+            // Don't throw - we don't want DynamoDB failures to break the whole process
         }
     }
 }
