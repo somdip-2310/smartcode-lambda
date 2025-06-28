@@ -81,12 +81,55 @@ public class BedrockAnalysisLambda implements RequestHandler<SQSEvent, Void> {
                 
                 // Update status to FAILED in DynamoDB
                 if (analysisId != null) {
-                    updateAnalysisStatus(analysisId, "FAILED", e.getMessage(), null);
+                    try {
+                        // Truncate error message to avoid DynamoDB item size limits
+                        String errorMessage = e.getMessage() != null ? 
+                            e.getMessage().substring(0, Math.min(e.getMessage().length(), 200)) : 
+                            "Unknown error occurred";
+                        
+                        updateAnalysisStatus(analysisId, "FAILED", 
+                            "Error: " + errorMessage, 
+                            null);
+                    } catch (Exception updateError) {
+                        context.getLogger().log("Failed to update analysis status: " + updateError.getMessage());
+                    }
                 }
                 
-                // Don't rethrow to prevent infinite retries for permanent failures
-                // Log the error and continue with next message
-                context.getLogger().log("Marking message as processed to prevent infinite retries");
+                // Determine if this is a permanent or transient failure
+                boolean isPermanentFailure = false;
+                
+                // Check for permanent failure conditions
+                if (e instanceof IllegalArgumentException || 
+                    e instanceof IllegalStateException ||
+                    e instanceof NullPointerException ||
+                    (e.getMessage() != null && (
+                        e.getMessage().contains("Invalid") ||
+                        e.getMessage().contains("required") ||
+                        e.getMessage().contains("empty") ||
+                        e.getMessage().contains("not found") ||
+                        e.getMessage().contains("Missing")
+                    ))) {
+                    isPermanentFailure = true;
+                    context.getLogger().log("Permanent failure detected, not retrying");
+                }
+                
+                // Check for S3 access denied or not found
+                if (e.getMessage() != null && (
+                    e.getMessage().contains("Access Denied") ||
+                    e.getMessage().contains("NoSuchKey") ||
+                    e.getMessage().contains("NoSuchBucket"))) {
+                    isPermanentFailure = true;
+                    context.getLogger().log("S3 access error - permanent failure");
+                }
+                
+                // For transient failures (network issues, throttling, etc.), throw to retry
+                if (!isPermanentFailure) {
+                    context.getLogger().log("Transient failure detected, will retry");
+                    throw new RuntimeException("Transient failure processing message", e);
+                }
+                
+                // For permanent failures, log and continue
+                context.getLogger().log("Permanent failure - marking message as processed to prevent infinite retries");
             }
         }
         return null;
@@ -254,10 +297,10 @@ public class BedrockAnalysisLambda implements RequestHandler<SQSEvent, Void> {
         } catch (Exception e) {
             context.getLogger().log("Failed to parse result as JSON, attempting to clean: " + e.getMessage());
             
-            // Try to extract JSON from the response if it contains extra text
+            // Try to extract JSON from the response
             String cleaned = result.trim();
             
-            // Remove markdown code blocks more robustly
+            // Remove markdown code blocks
             if (cleaned.contains("```json")) {
                 int startIndex = cleaned.indexOf("```json") + 7;
                 int endIndex = cleaned.lastIndexOf("```");
@@ -265,50 +308,46 @@ public class BedrockAnalysisLambda implements RequestHandler<SQSEvent, Void> {
                     cleaned = cleaned.substring(startIndex, endIndex).trim();
                 }
             } else if (cleaned.contains("```")) {
-                int startIndex = cleaned.indexOf("```") + 3;
-                int endIndex = cleaned.lastIndexOf("```");
-                if (endIndex > startIndex) {
-                    cleaned = cleaned.substring(startIndex, endIndex).trim();
-                }
+                cleaned = cleaned.replaceFirst("```[a-zA-Z]*\\n?", "").replaceAll("```\\s*$", "").trim();
             }
             
-            // Remove any leading/trailing whitespace or newlines
-            cleaned = cleaned.trim();
+            // Find JSON object boundaries
+            int jsonStart = cleaned.indexOf('{');
+            int jsonEnd = cleaned.lastIndexOf('}');
             
-            // Additional cleaning - remove any non-JSON characters at the beginning
-            while (cleaned.length() > 0 && cleaned.charAt(0) != '{' && cleaned.charAt(0) != '[') {
-                cleaned = cleaned.substring(1);
+            if (jsonStart >= 0 && jsonEnd > jsonStart) {
+                cleaned = cleaned.substring(jsonStart, jsonEnd + 1);
             }
             
             try {
                 return objectMapper.readValue(cleaned, Map.class);
             } catch (Exception e2) {
-                context.getLogger().log("Still failed to parse after cleaning. Original: " + result);
-                context.getLogger().log("Cleaned: " + cleaned);
-                context.getLogger().log("Error: " + e2.getMessage());
-                
-                // Return a default structure
-                Map<String, Object> defaultResult = new HashMap<>();
-                defaultResult.put("summary", "Analysis completed but result parsing failed");
-                defaultResult.put("overallScore", 5.0);
-                defaultResult.put("issues", new ArrayList<>());
-                defaultResult.put("suggestions", new ArrayList<>());
-                
-                Map<String, Object> security = new HashMap<>();
-                security.put("securityScore", 5.0);
-                security.put("vulnerabilities", new ArrayList<>());
-                security.put("hasSecurityIssues", false);
-                defaultResult.put("security", security);
-                
-                Map<String, Object> performance = new HashMap<>();
-                performance.put("performanceScore", 5.0);
-                performance.put("bottlenecks", new ArrayList<>());
-                performance.put("complexity", "Unknown");
-                defaultResult.put("performance", performance);
-                
-                return defaultResult;
+                context.getLogger().log("Failed to parse cleaned JSON: " + cleaned);
+                // Return a valid default structure
+                return createDefaultAnalysisResult();
             }
         }
+    }
+
+    private Map<String, Object> createDefaultAnalysisResult() {
+        Map<String, Object> result = new HashMap<>();
+        result.put("summary", "Analysis completed but result parsing failed. Please check logs.");
+        result.put("overallScore", 7.0);
+        result.put("issues", new ArrayList<>());
+        result.put("suggestions", Arrays.asList("Unable to parse detailed analysis results"));
+        
+        Map<String, Object> security = new HashMap<>();
+        security.put("securityScore", 7.0);
+        security.put("vulnerabilities", new ArrayList<>());
+        security.put("hasSecurityIssues", false);
+        result.put("security", security);
+        
+        Map<String, Object> performance = new HashMap<>();
+        performance.put("performanceScore", 7.0);
+        performance.put("bottlenecks", new ArrayList<>());
+        result.put("performance", performance);
+        
+        return result;
     }
     
     private String invokeBedrockWithRetry(String prompt, Context context) throws Exception {
@@ -462,53 +501,31 @@ public class BedrockAnalysisLambda implements RequestHandler<SQSEvent, Void> {
     }
     
     private String buildAnalysisPrompt(String code, String language) {
-        return String.format("""
-            You are an expert code reviewer. Analyze the following %s code and provide a comprehensive review.
-            
-            Focus on:
-            1. Security vulnerabilities
-            2. Performance issues
-            3. Code quality and maintainability
-            4. Best practices
-            5. Potential bugs
-            
-            CRITICAL: Your response must be ONLY the JSON object below, with NO additional text, NO markdown formatting, NO code blocks, and NO backticks.
-            
-            Return this exact JSON structure:
-            {
-              "summary": "Brief overview",
-              "overallScore": 8.5,
-              "issues": [{
-                "severity": "HIGH",
-                "type": "SECURITY",
-                "title": "Issue title",
-                "description": "Description",
-                "lineNumber": 15,
-                "suggestion": "How to fix"
-              }],
-              "suggestions": [{
-                "title": "Suggestion",
-                "description": "Description",
-                "category": "Performance",
-                "impact": "High"
-              }],
-              "security": {
-                "securityScore": 7.5,
-                "vulnerabilities": [],
-                "hasSecurityIssues": false
-              },
-              "performance": {
-                "performanceScore": 8.0,
-                "bottlenecks": [],
-                "complexity": "Medium"
-              }
-            }
-            
-            Code to analyze:
-            %s
-            
-            Remember: Return ONLY the JSON object, nothing else.
-            """, language != null ? language : "unknown", code);
+        return String.format(
+            "Analyze the following %s code and provide a comprehensive review.\n\n" +
+            "CRITICAL: Your response must be ONLY the JSON object, with NO additional text, NO markdown formatting, NO code blocks, and NO backticks.\n\n" +
+            "Code to analyze:\n%s\n\n" +
+            "Provide your analysis in the following JSON format:\n" +
+            "{\n" +
+            "  \"summary\": \"Brief summary of the code quality\",\n" +
+            "  \"overallScore\": 8.5,\n" +
+            "  \"issues\": [\n" +
+            "    {\"severity\": \"HIGH\", \"category\": \"Security\", \"description\": \"Issue description\", \"line\": 10, \"suggestion\": \"How to fix\"}\n" +
+            "  ],\n" +
+            "  \"suggestions\": [\"Improvement suggestion 1\", \"Improvement suggestion 2\"],\n" +
+            "  \"security\": {\n" +
+            "    \"securityScore\": 7.0,\n" +
+            "    \"vulnerabilities\": [{\"type\": \"SQL Injection\", \"severity\": \"HIGH\", \"description\": \"Details\"}],\n" +
+            "    \"hasSecurityIssues\": true\n" +
+            "  },\n" +
+            "  \"performance\": {\n" +
+            "    \"performanceScore\": 8.0,\n" +
+            "    \"bottlenecks\": [\"Issue 1\", \"Issue 2\"]\n" +
+            "  }\n" +
+            "}\n\nRespond with ONLY valid JSON.",
+            language != null ? language : "unknown",
+            code
+        );
     }
     
     private String buildChunkAnalysisPrompt(String code, String language, int chunkNumber, int totalChunks) {
