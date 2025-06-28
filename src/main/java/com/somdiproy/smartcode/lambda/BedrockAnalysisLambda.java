@@ -204,18 +204,41 @@ public class BedrockAnalysisLambda implements RequestHandler<SQSEvent, Void> {
         List<String> chunks = splitIntoChunks(code, MAX_CHUNK_SIZE);
         List<Map<String, Object>> chunkResults = new ArrayList<>();
         
+        // Process chunks with adaptive delays
+        int consecutiveThrottles = 0;
+        int baseChunkDelay = 10000; // 10 seconds base delay
+        
         for (int i = 0; i < chunks.size(); i++) {
             context.getLogger().log("Processing chunk " + (i + 1) + " of " + chunks.size());
             
-            String chunkPrompt = buildChunkAnalysisPrompt(chunks.get(i), language, i + 1, chunks.size());
-            String result = invokeBedrockWithRetry(chunkPrompt, context);
-            
-            Map<String, Object> chunkResult = parseAnalysisResult(result, context);
-            chunkResults.add(chunkResult);
-            
-            // Delay between chunks to avoid throttling
-            if (i < chunks.size() - 1) {
-                Thread.sleep(CHUNK_DELAY_MS);
+            try {
+                String chunkPrompt = buildChunkAnalysisPrompt(chunks.get(i), language, i + 1, chunks.size());
+                String result = invokeBedrockWithRetry(chunkPrompt, context);
+                
+                Map<String, Object> chunkResult = parseAnalysisResult(result, context);
+                chunkResults.add(chunkResult);
+                
+                // Reset throttle counter on success
+                consecutiveThrottles = 0;
+                
+                // Adaptive delay between chunks
+                if (i < chunks.size() - 1) {
+                    int delay = baseChunkDelay + (consecutiveThrottles * 5000);
+                    context.getLogger().log("Waiting " + delay + "ms before next chunk");
+                    Thread.sleep(delay);
+                }
+                
+            } catch (Exception e) {
+                if (e.getMessage().contains("429") || e.getMessage().contains("throttl")) {
+                    consecutiveThrottles++;
+                    
+                    // If too many throttles, increase base delay
+                    if (consecutiveThrottles > 2) {
+                        baseChunkDelay = Math.min(baseChunkDelay * 2, 60000); // Max 60s
+                        context.getLogger().log("Increasing base delay to " + baseChunkDelay + "ms due to throttling");
+                    }
+                }
+                throw e;
             }
         }
         
@@ -289,8 +312,8 @@ public class BedrockAnalysisLambda implements RequestHandler<SQSEvent, Void> {
     }
     
     private String invokeBedrockWithRetry(String prompt, Context context) throws Exception {
-        int maxRetries = 3;
-        int retryDelay = 2000; // Start with 2 seconds
+        int maxRetries = 5;  // Increased from 3
+        int baseDelay = 5000; // Start with 5 seconds
         
         for (int attempt = 0; attempt < maxRetries; attempt++) {
             try {
@@ -298,66 +321,84 @@ public class BedrockAnalysisLambda implements RequestHandler<SQSEvent, Void> {
                 Map<String, Object> requestBody = new HashMap<>();
                 
                 List<Map<String, Object>> messages = new ArrayList<>();
-                Map<String, Object> message = new HashMap<>();
-                message.put("role", "user");
-                
-                List<Map<String, Object>> contentArray = new ArrayList<>();
-                Map<String, Object> textContent = new HashMap<>();
-                textContent.put("text", prompt);
-                contentArray.add(textContent);
-                
-                message.put("content", contentArray);
-                messages.add(message);
+                Map<String, Object> userMessage = new HashMap<>();
+                userMessage.put("role", "user");
+                userMessage.put("content", prompt);
+                messages.add(userMessage); // Fixed: use add() instead of put()
                 
                 requestBody.put("messages", messages);
-                
-                Map<String, Object> inferenceConfig = new HashMap<>();
-                inferenceConfig.put("maxTokens", 4000);
-                inferenceConfig.put("temperature", 0.1);
-                inferenceConfig.put("topP", 0.9);
-                
-                requestBody.put("inferenceConfig", inferenceConfig);
+                requestBody.put("temperature", 0.7);
+                requestBody.put("max_tokens", 4000);
                 
                 String jsonBody = objectMapper.writeValueAsString(requestBody);
                 
                 InvokeModelRequest request = InvokeModelRequest.builder()
-                        .modelId(MODEL_ID != null ? MODEL_ID : "amazon.nova-premier-v1:0")
-                        .body(SdkBytes.fromUtf8String(jsonBody))
-                        .contentType("application/json")
-                        .accept("application/json")
-                        .build();
+                    .modelId(MODEL_ID != null ? MODEL_ID : "us.amazon.nova-premier-v1:0")
+                    .contentType("application/json")
+                    .accept("application/json")
+                    .body(SdkBytes.fromUtf8String(jsonBody))
+                    .build();
                 
                 InvokeModelResponse response = bedrockClient.invokeModel(request);
                 String responseBody = response.body().asUtf8String();
                 
-                // Parse Nova response
-                Map<String, Object> responseMap = objectMapper.readValue(responseBody, Map.class);
-                Map<String, Object> output = (Map<String, Object>) responseMap.get("output");
-                if (output != null) {
-                    Map<String, Object> outputMessage = (Map<String, Object>) output.get("message");
-                    if (outputMessage != null) {
-                        List<Map<String, Object>> content = (List<Map<String, Object>>) outputMessage.get("content");
-                        if (content != null && !content.isEmpty()) {
-                            return (String) content.get(0).get("text");
+                // Parse the response
+                Map<String, Object> parsedResponse = objectMapper.readValue(responseBody, Map.class);
+                
+                // Extract content from the response - Nova models return content differently
+                String content = null;
+                if (parsedResponse.containsKey("content")) {
+                    content = (String) parsedResponse.get("content");
+                } else if (parsedResponse.containsKey("completion")) {
+                    content = (String) parsedResponse.get("completion");
+                } else if (parsedResponse.containsKey("choices")) {
+                    // Handle choices array format
+                    List<Map<String, Object>> choices = (List<Map<String, Object>>) parsedResponse.get("choices");
+                    if (choices != null && !choices.isEmpty()) {
+                        Map<String, Object> firstChoice = choices.get(0);
+                        if (firstChoice.containsKey("message")) {
+                            Map<String, Object> message = (Map<String, Object>) firstChoice.get("message");
+                            content = (String) message.get("content");
+                        } else if (firstChoice.containsKey("text")) {
+                            content = (String) firstChoice.get("text");
                         }
                     }
                 }
                 
-                throw new RuntimeException("Invalid response from Bedrock");
+                if (content == null) {
+                    context.getLogger().log("Unexpected response format: " + responseBody);
+                    throw new Exception("Unable to extract content from Bedrock response");
+                }
+                
+                return content;
                 
             } catch (Exception e) {
-                context.getLogger().log("Bedrock invocation failed (attempt " + (attempt + 1) + "): " + e.getMessage());
+                String errorMessage = e.getMessage();
                 
-                if (attempt < maxRetries - 1) {
-                    Thread.sleep(retryDelay);
-                    retryDelay *= 2; // Exponential backoff
-                } else {
-                    throw e;
+                // Check if it's a rate limit error
+                if (errorMessage != null && (errorMessage.contains("429") || 
+                    errorMessage.contains("Too many requests") || 
+                    errorMessage.contains("throttl"))) {
+                    
+                    // Calculate exponential backoff with jitter
+                    int delay = baseDelay * (int)Math.pow(2, attempt) + 
+                               (int)(Math.random() * 1000);
+                    
+                    context.getLogger().log(String.format(
+                        "Bedrock invocation failed (attempt %d): %s. Retrying in %d ms", 
+                        attempt + 1, errorMessage, delay));
+                    
+                    if (attempt < maxRetries - 1) {
+                        Thread.sleep(delay);
+                        continue;
+                    }
                 }
+                
+                throw e;
             }
         }
         
-        throw new RuntimeException("Failed to invoke Bedrock after " + maxRetries + " attempts");
+        throw new Exception("Failed to invoke Bedrock after " + maxRetries + " attempts");
     }
     
     private List<String> splitIntoChunks(String code, int chunkSize) {
