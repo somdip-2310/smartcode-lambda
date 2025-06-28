@@ -27,8 +27,9 @@ public class BedrockAnalysisLambda implements RequestHandler<SQSEvent, Void> {
     private static final String BUCKET_NAME = System.getenv("S3_BUCKET_NAME");
     private static final String MODEL_ID = System.getenv("BEDROCK_MODEL_ID");
     private static final int MAX_CHUNK_SIZE = 50000; // characters
-    private static final int CHUNK_DELAY_MS = 5000; // 5 seconds between chunks
-    
+    private static final int MAX_RETRIES = Integer.parseInt(System.getenv().getOrDefault("MAX_RETRIES", "5"));
+    private static final int BASE_RETRY_DELAY = Integer.parseInt(System.getenv().getOrDefault("BASE_RETRY_DELAY", "20000"));
+    private static final int CHUNK_DELAY_MS = Integer.parseInt(System.getenv().getOrDefault("CHUNK_PROCESSING_DELAY", "25000"));
     private final BedrockRuntimeClient bedrockClient;
     private final AmazonDynamoDB dynamoDBClient;
     private final DynamoDB dynamoDB;
@@ -276,7 +277,7 @@ public class BedrockAnalysisLambda implements RequestHandler<SQSEvent, Void> {
         
         // Process chunks with adaptive delays
         int consecutiveThrottles = 0;
-        int baseChunkDelay = 10000; // 10 seconds base delay
+        int baseChunkDelay = CHUNK_DELAY_MS;// 25 seconds base delay
         
         for (int i = 0; i < chunks.size(); i++) {
             context.getLogger().log("Processing chunk " + (i + 1) + " of " + chunks.size());
@@ -456,7 +457,7 @@ public class BedrockAnalysisLambda implements RequestHandler<SQSEvent, Void> {
     
     private String invokeBedrockWithRetry(String prompt, Context context) throws Exception {
         int maxRetries = 5;
-        int baseDelay = 5000; // Start with 5 seconds
+        int baseDelay = BASE_RETRY_DELAY; // Start with 5 seconds
 
         for (int attempt = 0; attempt < maxRetries; attempt++) {
             try {
