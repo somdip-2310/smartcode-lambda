@@ -166,7 +166,7 @@ public class BedrockAnalysisLambda implements RequestHandler<SQSEvent, Void> {
         }
         
         // Merge results with original code for quality metrics
-        Map<String, Object> mergedResult = mergeChunkResults(chunkResults, code);
+        Map<String, Object> mergedResult = mergeChunkResults(chunkResults, code, metadata);
         
         // Add metadata if provided
         if (metadata != null && !mergedResult.containsKey("metadata")) {
@@ -439,7 +439,7 @@ public class BedrockAnalysisLambda implements RequestHandler<SQSEvent, Void> {
         }
     }
     
-    private Map<String, Object> mergeChunkResults(List<Map<String, Object>> chunkResults, String originalCode) {
+    private Map<String, Object> mergeChunkResults(List<Map<String, Object>> chunkResults, String originalCode, Map<String, Object> metadata) {
         Map<String, Object> merged = new HashMap<>();
         
         // Initialize aggregators
@@ -532,7 +532,13 @@ public class BedrockAnalysisLambda implements RequestHandler<SQSEvent, Void> {
         Map<String, Object> mergedQuality = new HashMap<>();
         mergedQuality.put("maintainabilityScore", 7.5);
         mergedQuality.put("readabilityScore", 8.0);
-        mergedQuality.put("linesOfCode", originalCode != null ? originalCode.split("\n").length : 0);
+        int linesOfCode = 0;
+        if (originalCode != null && !originalCode.isEmpty()) {
+            linesOfCode = originalCode.split("\n").length;
+        } else if (metadata != null && metadata.containsKey("linesOfCode")) {
+            linesOfCode = ((Number) metadata.get("linesOfCode")).intValue();
+        }
+        mergedQuality.put("linesOfCode", linesOfCode);
         mergedQuality.put("complexityScore", 5);
         mergedQuality.put("testCoverage", 0.0);
         mergedQuality.put("duplicateLines", 0);
