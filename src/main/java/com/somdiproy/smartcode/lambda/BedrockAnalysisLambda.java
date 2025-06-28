@@ -67,73 +67,77 @@ public class BedrockAnalysisLambda implements RequestHandler<SQSEvent, Void> {
     }
     
     @Override
-    public Void handleRequest(SQSEvent event, Context context) {
-        context.getLogger().log("Processing " + event.getRecords().size() + " messages");
-        
+    public void handleRequest(SQSEvent event, Context context) {
         for (SQSEvent.SQSMessage message : event.getRecords()) {
             String analysisId = null;
+            String originalCode = null; // Store original code
+            
             try {
-                analysisId = extractAnalysisId(message);
-                context.getLogger().log("Processing analysis: " + analysisId);
-                processMessage(message, context);
+                // Parse message
+                Map<String, Object> request = objectMapper.readValue(message.getBody(), Map.class);
+                analysisId = (String) request.get("analysisId");
+                originalCode = (String) request.get("code"); // Store for later use
+                String language = (String) request.get("language");
+                
+                context.getLogger().log("Processing analysis: " + analysisId + " for language: " + language);
+                
+                // Update status to processing
+                updateAnalysisStatus(analysisId, "PROCESSING", "Lambda is analyzing your code...", null);
+                
+                // Check if code needs chunking
+                if (originalCode.length() > MAX_CHUNK_SIZE) {
+                    // Process in chunks
+                    List<String> chunks = splitIntoChunks(originalCode, MAX_CHUNK_SIZE);
+                    List<Map<String, Object>> chunkResults = new ArrayList<>();
+                    
+                    for (int i = 0; i < chunks.size(); i++) {
+                        String prompt = buildChunkAnalysisPrompt(chunks.get(i), language, i + 1, chunks.size());
+                        String rawResponse = invokeBedrockWithRetry(prompt, context);
+                        Map<String, Object> chunkResult = parseAnalysisResult(rawResponse, context);
+                        chunkResults.add(chunkResult);
+                        
+                        // Add delay between chunks to avoid rate limiting
+                        if (i < chunks.size() - 1) {
+                            Thread.sleep(CHUNK_DELAY_MS);
+                        }
+                    }
+                    
+                    // Merge results - pass the original code
+                    Map<String, Object> finalResult = mergeChunkResults(chunkResults, originalCode);
+                    
+                    // Update with final result
+                    updateAnalysisStatus(analysisId, "COMPLETED", "Analysis completed successfully", finalResult);
+                } else {
+                    // Process normally
+                    String prompt = buildAnalysisPrompt(originalCode, language);
+                    String rawResponse = invokeBedrockWithRetry(prompt, context);
+                    Map<String, Object> result = parseAnalysisResult(rawResponse, context);
+                    
+                    // Add quality metrics with actual line count
+                    if (!result.containsKey("quality")) {
+                        Map<String, Object> quality = new HashMap<>();
+                        quality.put("maintainabilityScore", 7.5);
+                        quality.put("readabilityScore", 8.0);
+                        quality.put("linesOfCode", originalCode.split("\n").length);
+                        quality.put("complexityScore", 5);
+                        quality.put("testCoverage", 0.0);
+                        quality.put("duplicateLines", 0);
+                        result.put("quality", quality);
+                    }
+                    
+                    updateAnalysisStatus(analysisId, "COMPLETED", "Analysis completed successfully", result);
+                }
+                
             } catch (Exception e) {
-                context.getLogger().log("ERROR processing message: " + e.getMessage());
+                context.getLogger().log("ERROR: " + e.getMessage());
                 e.printStackTrace();
                 
-                // Update status to FAILED in DynamoDB
                 if (analysisId != null) {
-                    try {
-                        // Truncate error message to avoid DynamoDB item size limits
-                        String errorMessage = e.getMessage() != null ? 
-                            e.getMessage().substring(0, Math.min(e.getMessage().length(), 200)) : 
-                            "Unknown error occurred";
-                        
-                        updateAnalysisStatus(analysisId, "FAILED", 
-                            "Error: " + errorMessage, 
-                            null);
-                    } catch (Exception updateError) {
-                        context.getLogger().log("Failed to update analysis status: " + updateError.getMessage());
-                    }
+                    updateAnalysisStatus(analysisId, "FAILED", 
+                        "Analysis failed: " + e.getMessage(), null);
                 }
-                
-                // Determine if this is a permanent or transient failure
-                boolean isPermanentFailure = false;
-                
-                // Check for permanent failure conditions
-                if (e instanceof IllegalArgumentException || 
-                    e instanceof IllegalStateException ||
-                    e instanceof NullPointerException ||
-                    (e.getMessage() != null && (
-                        e.getMessage().contains("Invalid") ||
-                        e.getMessage().contains("required") ||
-                        e.getMessage().contains("empty") ||
-                        e.getMessage().contains("not found") ||
-                        e.getMessage().contains("Missing")
-                    ))) {
-                    isPermanentFailure = true;
-                    context.getLogger().log("Permanent failure detected, not retrying");
-                }
-                
-                // Check for S3 access denied or not found
-                if (e.getMessage() != null && (
-                    e.getMessage().contains("Access Denied") ||
-                    e.getMessage().contains("NoSuchKey") ||
-                    e.getMessage().contains("NoSuchBucket"))) {
-                    isPermanentFailure = true;
-                    context.getLogger().log("S3 access error - permanent failure");
-                }
-                
-                // For transient failures (network issues, throttling, etc.), throw to retry
-                if (!isPermanentFailure) {
-                    context.getLogger().log("Transient failure detected, will retry");
-                    throw new RuntimeException("Transient failure processing message", e);
-                }
-                
-                // For permanent failures, log and continue
-                context.getLogger().log("Permanent failure - marking message as processed to prevent infinite retries");
             }
         }
-        return null;
     }
     
     private String extractAnalysisId(SQSEvent.SQSMessage message) {
@@ -651,92 +655,104 @@ public class BedrockAnalysisLambda implements RequestHandler<SQSEvent, Void> {
             """, chunkNumber, totalChunks, language != null ? language : "unknown", code);
     }
     
-    private Map<String, Object> mergeChunkResults(List<Map<String, Object>> chunkResults) {
-        Map<String, Object> merged = new HashMap<>();
-        
-        // Aggregate all issues and suggestions
-        List<Map<String, Object>> allIssues = new ArrayList<>();
-        List<Map<String, Object>> allSuggestions = new ArrayList<>();
-        double totalScore = 0;
-        int validScores = 0;
-        
-        // Security and performance aggregation
-        double totalSecurityScore = 0;
-        double totalPerformanceScore = 0;
-        int securityScoreCount = 0;
-        int performanceScoreCount = 0;
-        List<Map<String, Object>> allVulnerabilities = new ArrayList<>();
-        List<Map<String, Object>> allBottlenecks = new ArrayList<>();
-        boolean hasSecurityIssues = false;
-        
-        for (Map<String, Object> chunk : chunkResults) {
-            // Aggregate issues
-            if (chunk.containsKey("issues")) {
-                allIssues.addAll((List<Map<String, Object>>) chunk.get("issues"));
-            }
-            
-            // Aggregate suggestions
-            if (chunk.containsKey("suggestions")) {
-                allSuggestions.addAll((List<Map<String, Object>>) chunk.get("suggestions"));
-            }
-            
-            // Aggregate scores
-            if (chunk.containsKey("overallScore")) {
-                totalScore += ((Number) chunk.get("overallScore")).doubleValue();
-                validScores++;
-            }
-            
-            // Aggregate security data
-            if (chunk.containsKey("security")) {
-                Map<String, Object> security = (Map<String, Object>) chunk.get("security");
-                if (security.containsKey("securityScore")) {
-                    totalSecurityScore += ((Number) security.get("securityScore")).doubleValue();
-                    securityScoreCount++;
-                }
-                if (security.containsKey("vulnerabilities")) {
-                    allVulnerabilities.addAll((List<Map<String, Object>>) security.get("vulnerabilities"));
-                }
-                if (security.containsKey("hasSecurityIssues") && (Boolean) security.get("hasSecurityIssues")) {
-                    hasSecurityIssues = true;
-                }
-            }
-            
-            // Aggregate performance data
-            if (chunk.containsKey("performance")) {
-                Map<String, Object> performance = (Map<String, Object>) chunk.get("performance");
-                if (performance.containsKey("performanceScore")) {
-                    totalPerformanceScore += ((Number) performance.get("performanceScore")).doubleValue();
-                    performanceScoreCount++;
-                }
-                if (performance.containsKey("bottlenecks")) {
-                    allBottlenecks.addAll((List<Map<String, Object>>) performance.get("bottlenecks"));
-                }
-            }
-        }
-        
-        // Build merged result
-        merged.put("summary", "Comprehensive analysis completed across " + chunkResults.size() + " code segments");
-        merged.put("overallScore", validScores > 0 ? totalScore / validScores : 5.0);
-        merged.put("issues", allIssues);
-        merged.put("suggestions", allSuggestions);
-        merged.put("chunkCount", chunkResults.size());
-        
-        // Build security object
-        Map<String, Object> mergedSecurity = new HashMap<>();
-        mergedSecurity.put("securityScore", securityScoreCount > 0 ? totalSecurityScore / securityScoreCount : 7.0);
-        mergedSecurity.put("vulnerabilities", allVulnerabilities);
-        mergedSecurity.put("hasSecurityIssues", hasSecurityIssues);
-        merged.put("security", mergedSecurity);
-        
-        // Build performance object
-        Map<String, Object> mergedPerformance = new HashMap<>();
-        mergedPerformance.put("performanceScore", performanceScoreCount > 0 ? totalPerformanceScore / performanceScoreCount : 7.0);
-        mergedPerformance.put("bottlenecks", allBottlenecks);
-        mergedPerformance.put("complexity", "Medium");
-        merged.put("performance", mergedPerformance);
-        
-        return merged;
-    }
+ 
+
+ private Map<String, Object> mergeChunkResults(List<Map<String, Object>> chunkResults, String originalCode) {
+     Map<String, Object> merged = new HashMap<>();
+     
+     // Initialize aggregators
+     double totalScore = 0;
+     int validScores = 0;
+     List<Map<String, Object>> allIssues = new ArrayList<>();
+     List<Map<String, Object>> allSuggestions = new ArrayList<>();
+     List<Map<String, Object>> allVulnerabilities = new ArrayList<>();
+     List<Map<String, Object>> allBottlenecks = new ArrayList<>();
+     
+     double totalSecurityScore = 0;
+     int securityScoreCount = 0;
+     double totalPerformanceScore = 0;
+     int performanceScoreCount = 0;
+     boolean hasSecurityIssues = false;
+     
+     // Aggregate results from all chunks
+     for (Map<String, Object> chunk : chunkResults) {
+         // Aggregate overall scores
+         if (chunk.containsKey("overallScore")) {
+             totalScore += ((Number) chunk.get("overallScore")).doubleValue();
+             validScores++;
+         }
+         
+         // Aggregate issues
+         if (chunk.containsKey("issues") && chunk.get("issues") instanceof List) {
+             allIssues.addAll((List<Map<String, Object>>) chunk.get("issues"));
+         }
+         
+         // Aggregate suggestions
+         if (chunk.containsKey("suggestions") && chunk.get("suggestions") instanceof List) {
+             allSuggestions.addAll((List<Map<String, Object>>) chunk.get("suggestions"));
+         }
+         
+         // Aggregate security data
+         if (chunk.containsKey("security")) {
+             Map<String, Object> security = (Map<String, Object>) chunk.get("security");
+             if (security.containsKey("securityScore")) {
+                 totalSecurityScore += ((Number) security.get("securityScore")).doubleValue();
+                 securityScoreCount++;
+             }
+             if (security.containsKey("vulnerabilities")) {
+                 allVulnerabilities.addAll((List<Map<String, Object>>) security.get("vulnerabilities"));
+             }
+             if (security.containsKey("hasSecurityIssues") && (Boolean) security.get("hasSecurityIssues")) {
+                 hasSecurityIssues = true;
+             }
+         }
+         
+         // Aggregate performance data
+         if (chunk.containsKey("performance")) {
+             Map<String, Object> performance = (Map<String, Object>) chunk.get("performance");
+             if (performance.containsKey("performanceScore")) {
+                 totalPerformanceScore += ((Number) performance.get("performanceScore")).doubleValue();
+                 performanceScoreCount++;
+             }
+             if (performance.containsKey("bottlenecks")) {
+                 allBottlenecks.addAll((List<Map<String, Object>>) performance.get("bottlenecks"));
+             }
+         }
+     }
+     
+     // Build merged result
+     merged.put("summary", "Comprehensive analysis completed across " + chunkResults.size() + " code segments");
+     merged.put("overallScore", validScores > 0 ? totalScore / validScores : 5.0);
+     merged.put("issues", allIssues);
+     merged.put("suggestions", allSuggestions);
+     merged.put("chunkCount", chunkResults.size());
+     
+     // Build security object
+     Map<String, Object> mergedSecurity = new HashMap<>();
+     mergedSecurity.put("securityScore", securityScoreCount > 0 ? totalSecurityScore / securityScoreCount : 7.0);
+     mergedSecurity.put("vulnerabilities", allVulnerabilities);
+     mergedSecurity.put("hasSecurityIssues", hasSecurityIssues);
+     merged.put("security", mergedSecurity);
+     
+     // Build performance object
+     Map<String, Object> mergedPerformance = new HashMap<>();
+     mergedPerformance.put("performanceScore", performanceScoreCount > 0 ? totalPerformanceScore / performanceScoreCount : 7.0);
+     mergedPerformance.put("bottlenecks", allBottlenecks);
+     mergedPerformance.put("complexity", "Medium");
+     merged.put("performance", mergedPerformance);
+     
+     // Build quality metrics object with actual line count
+     Map<String, Object> mergedQuality = new HashMap<>();
+     mergedQuality.put("maintainabilityScore", 7.5); // Default score
+     mergedQuality.put("readabilityScore", 8.0);
+     mergedQuality.put("linesOfCode", originalCode != null ? originalCode.split("\n").length : 0);
+     mergedQuality.put("complexityScore", 5);
+     mergedQuality.put("testCoverage", 0.0);
+     mergedQuality.put("duplicateLines", 0);
+     merged.put("quality", mergedQuality);
+     
+     return merged;
+ }
     
     private void updateAnalysisStatus(String analysisId, String status, String message, Map<String, Object> result) {
         try {
