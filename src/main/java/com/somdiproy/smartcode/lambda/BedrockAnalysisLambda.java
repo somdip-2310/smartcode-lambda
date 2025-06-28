@@ -312,92 +312,132 @@ public class BedrockAnalysisLambda implements RequestHandler<SQSEvent, Void> {
     }
     
     private String invokeBedrockWithRetry(String prompt, Context context) throws Exception {
-        int maxRetries = 5;  // Increased from 3
+        int maxRetries = 5;
         int baseDelay = 5000; // Start with 5 seconds
-        
+
         for (int attempt = 0; attempt < maxRetries; attempt++) {
             try {
                 // Build request for Nova Premier
                 Map<String, Object> requestBody = new HashMap<>();
-                
+
+                // Create messages array
                 List<Map<String, Object>> messages = new ArrayList<>();
                 Map<String, Object> userMessage = new HashMap<>();
                 userMessage.put("role", "user");
-                userMessage.put("content", prompt);
-                messages.add(userMessage); // Fixed: use add() instead of put()
                 
+                // CRITICAL FIX: Content must be an array of objects for Nova Premier
+                List<Map<String, Object>> contentArray = new ArrayList<>();
+                Map<String, Object> textContent = new HashMap<>();
+                textContent.put("text", prompt);
+                contentArray.add(textContent);
+                
+                userMessage.put("content", contentArray); // Content as array, not string
+                messages.add(userMessage);
+
                 requestBody.put("messages", messages);
-                requestBody.put("temperature", 0.7);
-                requestBody.put("max_tokens", 4000);
-                
+
+                // Create inference config for Nova Premier
+                Map<String, Object> inferenceConfig = new HashMap<>();
+                inferenceConfig.put("maxTokens", 4000);
+                inferenceConfig.put("temperature", 0.7);
+                inferenceConfig.put("topP", 0.9);
+
+                requestBody.put("inferenceConfig", inferenceConfig);
+
                 String jsonBody = objectMapper.writeValueAsString(requestBody);
                 
+                // Log the request for debugging (remove in production)
+                context.getLogger().log("Bedrock request (attempt " + (attempt + 1) + "): " + jsonBody);
+
                 InvokeModelRequest request = InvokeModelRequest.builder()
-                    .modelId(MODEL_ID != null ? MODEL_ID : "us.amazon.nova-premier-v1:0")
-                    .contentType("application/json")
-                    .accept("application/json")
-                    .body(SdkBytes.fromUtf8String(jsonBody))
-                    .build();
-                
+                        .modelId(MODEL_ID != null ? MODEL_ID : "us.amazon.nova-premier-v1:0")
+                        .contentType("application/json")
+                        .accept("application/json")
+                        .body(SdkBytes.fromUtf8String(jsonBody))
+                        .build();
+
                 InvokeModelResponse response = bedrockClient.invokeModel(request);
                 String responseBody = response.body().asUtf8String();
                 
-                // Parse the response
+                // Log the response for debugging (remove in production)
+                context.getLogger().log("Bedrock response: " + responseBody);
+
+                // Parse the response - Nova Premier specific format
                 Map<String, Object> parsedResponse = objectMapper.readValue(responseBody, Map.class);
-                
-                // Extract content from the response - Nova models return content differently
+
+                // Extract content from Nova Premier response format
                 String content = null;
-                if (parsedResponse.containsKey("content")) {
-                    content = (String) parsedResponse.get("content");
-                } else if (parsedResponse.containsKey("completion")) {
-                    content = (String) parsedResponse.get("completion");
-                } else if (parsedResponse.containsKey("choices")) {
-                    // Handle choices array format
-                    List<Map<String, Object>> choices = (List<Map<String, Object>>) parsedResponse.get("choices");
-                    if (choices != null && !choices.isEmpty()) {
-                        Map<String, Object> firstChoice = choices.get(0);
-                        if (firstChoice.containsKey("message")) {
-                            Map<String, Object> message = (Map<String, Object>) firstChoice.get("message");
-                            content = (String) message.get("content");
-                        } else if (firstChoice.containsKey("text")) {
-                            content = (String) firstChoice.get("text");
+                
+                // Nova Premier returns: { "output": { "message": { "content": [{ "text": "..." }] } } }
+                if (parsedResponse.containsKey("output")) {
+                    Map<String, Object> output = (Map<String, Object>) parsedResponse.get("output");
+                    if (output != null && output.containsKey("message")) {
+                        Map<String, Object> message = (Map<String, Object>) output.get("message");
+                        if (message != null && message.containsKey("content")) {
+                            List<Map<String, Object>> contentList = (List<Map<String, Object>>) message.get("content");
+                            if (contentList != null && !contentList.isEmpty()) {
+                                Map<String, Object> firstContent = contentList.get(0);
+                                if (firstContent.containsKey("text")) {
+                                    content = (String) firstContent.get("text");
+                                }
+                            }
                         }
                     }
                 }
                 
+                // Fallback for other response formats
+                if (content == null && parsedResponse.containsKey("content")) {
+                    content = (String) parsedResponse.get("content");
+                } else if (content == null && parsedResponse.containsKey("completion")) {
+                    content = (String) parsedResponse.get("completion");
+                }
+
                 if (content == null) {
                     context.getLogger().log("Unexpected response format: " + responseBody);
                     throw new Exception("Unable to extract content from Bedrock response");
                 }
-                
+
                 return content;
-                
+
             } catch (Exception e) {
                 String errorMessage = e.getMessage();
-                
+                context.getLogger().log("Bedrock invocation failed (attempt " + (attempt + 1) + "): " + errorMessage);
+
                 // Check if it's a rate limit error
                 if (errorMessage != null && (errorMessage.contains("429") || 
                     errorMessage.contains("Too many requests") || 
                     errorMessage.contains("throttl"))) {
-                    
+
                     // Calculate exponential backoff with jitter
-                    int delay = baseDelay * (int)Math.pow(2, attempt) + 
-                               (int)(Math.random() * 1000);
-                    
+                    int delay = baseDelay * (int) Math.pow(2, attempt) + (int) (Math.random() * 1000);
+
                     context.getLogger().log(String.format(
-                        "Bedrock invocation failed (attempt %d): %s. Retrying in %d ms", 
-                        attempt + 1, errorMessage, delay));
-                    
+                        "Rate limited. Retrying in %d ms", delay));
+
                     if (attempt < maxRetries - 1) {
                         Thread.sleep(delay);
                         continue;
                     }
                 }
-                
+
+                // For non-rate limit errors, fail immediately if it's a validation error
+                if (errorMessage != null && (errorMessage.contains("ValidationException") || 
+                    errorMessage.contains("Malformed input"))) {
+                    throw e; // Don't retry validation errors
+                }
+
+                // For other errors, retry with backoff
+                if (attempt < maxRetries - 1) {
+                    int delay = baseDelay * (attempt + 1);
+                    context.getLogger().log("Retrying after " + delay + "ms");
+                    Thread.sleep(delay);
+                    continue;
+                }
+
                 throw e;
             }
         }
-        
+
         throw new Exception("Failed to invoke Bedrock after " + maxRetries + " attempts");
     }
     
@@ -468,8 +508,7 @@ public class BedrockAnalysisLambda implements RequestHandler<SQSEvent, Void> {
             %s
             
             Remember: Return ONLY the JSON object, nothing else.
-            """, language, code);
-    
+            """, language != null ? language : "unknown", code);
     }
     
     private String buildChunkAnalysisPrompt(String code, String language, int chunkNumber, int totalChunks) {
@@ -479,15 +518,15 @@ public class BedrockAnalysisLambda implements RequestHandler<SQSEvent, Void> {
             Analyze for issues and improvements in this code segment.
             Note: This is a partial analysis of a larger file.
             
-            Use the same JSON response format as specified.
+            CRITICAL: Your response must be ONLY the JSON object, with NO additional text, NO markdown formatting, NO code blocks, and NO backticks.
             
-            Code chunk:
-            ```%s
+            Use the same JSON response format as in the main analysis.
+            
+            Code chunk to analyze:
             %s
-            ```
             
-            Respond with ONLY valid JSON without any markdown formatting or code blocks.
-            """, chunkNumber, totalChunks, language, language, code);
+            Respond with ONLY valid JSON.
+            """, chunkNumber, totalChunks, language != null ? language : "unknown", code);
     }
     
     private Map<String, Object> mergeChunkResults(List<Map<String, Object>> chunkResults) {
