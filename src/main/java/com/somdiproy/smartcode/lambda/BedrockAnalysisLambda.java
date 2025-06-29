@@ -28,7 +28,7 @@ import java.time.Duration;
 public class BedrockAnalysisLambda implements RequestHandler<SQSEvent, Void> {
     
     private static final String TABLE_NAME = System.getenv("DYNAMODB_TABLE_NAME");
-    private static final String BUCKET_NAME = System.getenv("S3_BUCKET_NAME");
+    private static final String BUCKET_NAME = System.getenv().getOrDefault("S3_BUCKET_NAME", "smartcode-uploads");
     private static final String MODEL_ID = System.getenv("BEDROCK_MODEL_ID");
     private static final int MAX_CHUNK_SIZE = 30000; // Reduced chunk size
     private static final int MAX_RETRIES = Integer.parseInt(System.getenv().getOrDefault("MAX_RETRIES", "5"));
