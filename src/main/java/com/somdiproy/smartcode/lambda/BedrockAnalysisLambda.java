@@ -43,7 +43,12 @@ public class BedrockAnalysisLambda implements RequestHandler<SQSEvent, Void> {
     private static volatile int consecutiveFailures = 0;
     private static volatile long circuitBreakerOpenTime = 0;
     private static final Object circuitBreakerLock = new Object();
-    
+ // Emergency pause configuration
+    private static final int EMERGENCY_PAUSE_THRESHOLD = Integer.parseInt(System.getenv().getOrDefault("EMERGENCY_PAUSE_THRESHOLD", "10"));
+    private static final long EMERGENCY_PAUSE_DURATION_MS = Long.parseLong(System.getenv().getOrDefault("EMERGENCY_PAUSE_DURATION_MS", "600000"));
+    private static volatile int globalErrorCount = 0;
+    private static volatile long emergencyPauseUntil = 0;
+    private static final Object emergencyPauseLock = new Object();
     
     private final BedrockRuntimeClient bedrockClient;
     private final AmazonDynamoDB dynamoDBClient;
@@ -134,6 +139,36 @@ public class BedrockAnalysisLambda implements RequestHandler<SQSEvent, Void> {
         }
     }
     
+    private void checkEmergencyPause(Context context) throws Exception {
+        synchronized (emergencyPauseLock) {
+            if (emergencyPauseUntil > System.currentTimeMillis()) {
+                long remainingPause = emergencyPauseUntil - System.currentTimeMillis();
+                context.getLogger().log("EMERGENCY PAUSE ACTIVE: Remaining time: " + remainingPause + "ms");
+                throw new RuntimeException("Emergency pause active for " + remainingPause + "ms due to excessive errors");
+            }
+        }
+    }
+
+    private void incrementGlobalErrorCount(Context context) {
+        synchronized (emergencyPauseLock) {
+            globalErrorCount++;
+            context.getLogger().log("Global error count: " + globalErrorCount + "/" + EMERGENCY_PAUSE_THRESHOLD);
+            
+            if (globalErrorCount >= EMERGENCY_PAUSE_THRESHOLD) {
+                emergencyPauseUntil = System.currentTimeMillis() + EMERGENCY_PAUSE_DURATION_MS;
+                context.getLogger().log("EMERGENCY PAUSE ACTIVATED: Pausing all processing for " + EMERGENCY_PAUSE_DURATION_MS + "ms");
+            }
+        }
+    }
+
+    private void resetGlobalErrorCount() {
+        synchronized (emergencyPauseLock) {
+            if (globalErrorCount > 0) {
+                globalErrorCount = Math.max(0, globalErrorCount - 1); // Gradual recovery
+            }
+        }
+    }
+    
     @Override
     public Void handleRequest(SQSEvent event, Context context) {
         context.getLogger().log("Processing " + event.getRecords().size() + " messages");
@@ -151,6 +186,14 @@ public class BedrockAnalysisLambda implements RequestHandler<SQSEvent, Void> {
                 context.getLogger().log("Error processing message: " + e.getMessage());
                 e.printStackTrace();
                 
+                // Check if it's an emergency pause exception
+                if (e.getMessage() != null && e.getMessage().contains("Emergency pause active")) {
+                    // Don't count emergency pause as an error
+                    throw new RuntimeException(e.getMessage(), e);
+                }
+                // Increment global error count for other errors
+                incrementGlobalErrorCount(context);
+                
                 // Update status to FAILED in DynamoDB
                 if (analysisId != null) {
                     updateAnalysisStatus(analysisId, "FAILED", "Processing failed: " + e.getMessage(), null, null);
@@ -164,7 +207,8 @@ public class BedrockAnalysisLambda implements RequestHandler<SQSEvent, Void> {
     }
     
     private void processMessage(SQSEvent.SQSMessage message, Context context) throws Exception {
-        context.getLogger().log("Processing message: " + message.getMessageId());
+    	checkEmergencyPause(context);
+    	context.getLogger().log("Processing message: " + message.getMessageId());
         
         // Parse message body
         Map<String, Object> messageBody = objectMapper.readValue(message.getBody(), Map.class);
@@ -216,6 +260,8 @@ public class BedrockAnalysisLambda implements RequestHandler<SQSEvent, Void> {
         ensureQualityMetrics(analysisResult, code);
         
         updateAnalysisStatus(analysisId, "COMPLETED", "Analysis completed successfully", analysisResult, metadata);
+        // Reset error count on success
+        resetGlobalErrorCount();
     }
     
     private void processInChunks(String analysisId, String code, String language, Context context, Map<String, Object> metadata) throws Exception {
@@ -385,6 +431,7 @@ public class BedrockAnalysisLambda implements RequestHandler<SQSEvent, Void> {
         }
         
         recordFailure(); // Record failure for circuit breaker
+        incrementGlobalErrorCount(context); // Track for emergency pause
         throw new RuntimeException("Failed to invoke Bedrock after " + MAX_RETRIES + " attempts");
     }
     
