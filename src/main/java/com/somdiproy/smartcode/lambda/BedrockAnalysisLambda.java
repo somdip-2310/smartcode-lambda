@@ -323,6 +323,69 @@ public class BedrockAnalysisLambda implements RequestHandler<SQSEvent, Void> {
                     String description = (String) issue.get("description");
                     issue.put("title", description.length() > 50 ? description.substring(0, 50) + "..." : description);
                 }
+                
+                // NEW: Ensure enhanced fix instruction fields have defaults
+                if (!issue.containsKey("codeSnippet")) {
+                    issue.put("codeSnippet", "");
+                }
+                
+                if (!issue.containsKey("fixInstructions")) {
+                    // Generate basic fix instructions based on severity and category
+                    String severity = (String) issue.get("severity");
+                    String category = (String) issue.get("category");
+                    String basicInstructions = String.format(
+                        "Step 1: Review the %s issue in your code\\n" +
+                        "Step 2: Apply %s best practices\\n" +
+                        "Step 3: Test the changes thoroughly\\n" +
+                        "Step 4: Verify the issue is resolved",
+                        severity.toLowerCase(), category.toLowerCase()
+                    );
+                    issue.put("fixInstructions", basicInstructions);
+                }
+                
+                if (!issue.containsKey("searchPattern")) {
+                    // Try to extract from codeSnippet if available
+                    String codeSnippet = (String) issue.get("codeSnippet");
+                    issue.put("searchPattern", codeSnippet != null && !codeSnippet.isEmpty() ? codeSnippet : "");
+                }
+                
+                if (!issue.containsKey("replacePattern")) {
+                    issue.put("replacePattern", "");
+                }
+                
+                if (!issue.containsKey("correctedCode")) {
+                    issue.put("correctedCode", "");
+                }
+                
+                if (!issue.containsKey("implementationGuide")) {
+                    String category = (String) issue.get("category");
+                    String guide = "General Implementation Guide:\\n" +
+                                  "1. Understand the root cause of the issue\\n" +
+                                  "2. Review " + category + " best practices\\n" +
+                                  "3. Implement the recommended fix\\n" +
+                                  "4. Test edge cases and error scenarios\\n" +
+                                  "5. Document the changes made\\n" +
+                                  "6. Consider preventive measures for similar issues";
+                    issue.put("implementationGuide", guide);
+                }
+                
+                if (!issue.containsKey("estimatedEffort")) {
+                    // Estimate effort based on severity
+                    String severity = (String) issue.get("severity");
+                    String effort = severity.equals("CRITICAL") ? "30-60 minutes" :
+                                   severity.equals("HIGH") ? "15-30 minutes" :
+                                   severity.equals("MEDIUM") ? "10-20 minutes" : "5-10 minutes";
+                    issue.put("estimatedEffort", effort);
+                }
+                
+                if (!issue.containsKey("cveScore")) {
+                    // Assign CVE score based on severity
+                    String severity = (String) issue.get("severity");
+                    Double cveScore = severity.equals("CRITICAL") ? 9.0 :
+                                     severity.equals("HIGH") ? 7.5 :
+                                     severity.equals("MEDIUM") ? 5.0 : 2.5;
+                    issue.put("cveScore", cveScore);
+                }
             }
         }
         
@@ -351,6 +414,10 @@ public class BedrockAnalysisLambda implements RequestHandler<SQSEvent, Void> {
                     }
                     if (!suggestionMap.containsKey("impact")) {
                         suggestionMap.put("impact", "MEDIUM");
+                    }
+                    // NEW: Add implementation field if missing
+                    if (!suggestionMap.containsKey("implementation")) {
+                        suggestionMap.put("implementation", "Follow industry best practices for this improvement");
                     }
                     normalizedSuggestions.add(suggestionMap);
                 }
@@ -574,7 +641,16 @@ public class BedrockAnalysisLambda implements RequestHandler<SQSEvent, Void> {
             
             CRITICAL: Your response must be ONLY the JSON object, with NO additional text, NO markdown formatting, NO code blocks, and NO backticks.
             
-            IMPORTANT: In the issues array, use "lineNumber" (not "line") as an integer value, not an array.
+            IMPORTANT: 
+            1. In the issues array, use "lineNumber" (not "line") as an integer value, not an array.
+            2. For EACH issue, provide detailed fix instructions with ALL the following fields:
+               - fixInstructions: Step-by-step guide to fix the issue
+               - searchPattern: Exact code to search for
+               - replacePattern: Exact code to replace with
+               - correctedCode: Complete example of the fixed code
+               - implementationGuide: Detailed explanation and best practices
+               - estimatedEffort: Time estimate to implement the fix
+               - cveScore: CVE score if applicable (for security issues)
             
             Code to analyze:
             %s
@@ -589,18 +665,27 @@ public class BedrockAnalysisLambda implements RequestHandler<SQSEvent, Void> {
                   "category": "Security",
                   "type": "VULNERABILITY",
                   "title": "SQL Injection vulnerability",
-                  "description": "User input is directly concatenated into SQL query",
+                  "description": "User input is directly concatenated into SQL query creating injection risk",
                   "lineNumber": 10,
                   "fileName": "Example.java",
-                  "suggestion": "Use parameterized queries"
+                  "suggestion": "Use parameterized queries to prevent SQL injection",
+                  "codeSnippet": "query = 'SELECT * FROM users WHERE id = ' + userId",
+                  "fixInstructions": "Step 1: Import java.sql.PreparedStatement\\nStep 2: Replace string concatenation with parameterized query\\nStep 3: Use setString() for string parameters\\nStep 4: Execute with executeQuery()\\nStep 5: Test with malicious inputs",
+                  "searchPattern": "query = 'SELECT * FROM users WHERE id = ' + userId",
+                  "replacePattern": "String sql = 'SELECT * FROM users WHERE id = ?';\\nPreparedStatement pstmt = connection.prepareStatement(sql);\\npstmt.setString(1, userId);\\nResultSet rs = pstmt.executeQuery();",
+                  "correctedCode": "// Secure parameterized query\\nString sql = 'SELECT * FROM users WHERE id = ?';\\ntry (PreparedStatement pstmt = connection.prepareStatement(sql)) {\\n    pstmt.setString(1, userId);\\n    ResultSet rs = pstmt.executeQuery();\\n    while (rs.next()) {\\n        // Process results\\n    }\\n} catch (SQLException e) {\\n    logger.error('Database error', e);\\n    throw new RuntimeException('Failed to fetch user', e);\\n}",
+                  "implementationGuide": "SQL Injection Prevention Guide:\\n1. Never concatenate user input into SQL\\n2. Use PreparedStatement for all dynamic queries\\n3. Use ? placeholders for parameters\\n4. Bind parameters with appropriate setters\\n5. Use try-with-resources for cleanup\\n6. Consider ORM frameworks for additional safety\\n7. Validate all user inputs\\n8. Apply least privilege to DB users\\n9. Enable SQL query logging in development\\n10. Regular security audits",
+                  "estimatedEffort": "15-20 minutes",
+                  "cveScore": 8.5
                 }
               ],
               "suggestions": [
                 {
                   "title": "Improve error handling",
-                  "description": "Add try-catch blocks for database operations",
+                  "description": "Add comprehensive try-catch blocks for database operations",
                   "category": "Best Practice",
-                  "impact": "HIGH"
+                  "impact": "HIGH",
+                  "implementation": "Wrap all database operations in try-catch blocks with proper logging and user-friendly error messages"
                 }
               ],
               "security": {
@@ -611,7 +696,8 @@ public class BedrockAnalysisLambda implements RequestHandler<SQSEvent, Void> {
                     "severity": "HIGH",
                     "description": "Direct string concatenation in SQL query",
                     "location": "line 45",
-                    "remediation": "Use prepared statements"
+                    "remediation": "Use prepared statements",
+                    "cveScore": 8.5
                   }
                 ],
                 "hasSecurityIssues": true,
@@ -631,7 +717,7 @@ public class BedrockAnalysisLambda implements RequestHandler<SQSEvent, Void> {
                     "location": "getUserDetails method",
                     "description": "Database query inside a loop",
                     "solution": "Use JOIN query or batch loading",
-                    "estimatedImpact": "50% faster"
+                    "estimatedImpact": "50%% faster"
                   }
                 ]
               },
@@ -646,7 +732,12 @@ public class BedrockAnalysisLambda implements RequestHandler<SQSEvent, Void> {
               }
             }
             
-            Respond with ONLY valid JSON. Ensure all numeric fields are numbers, not arrays.
+            Remember: 
+            1. Return ONLY valid JSON
+            2. Include detailed fix instructions for EVERY issue
+            3. Provide exact search/replace patterns
+            4. Include complete corrected code examples
+            5. All numeric fields must be numbers, not arrays
             """, 
             language != null ? language : "unknown",
             code,
@@ -665,7 +756,7 @@ public class BedrockAnalysisLambda implements RequestHandler<SQSEvent, Void> {
             
             IMPORTANT: In the issues array, use "lineNumber" (not "line") as an integer value, not an array.
             
-            Use the same JSON response format as in the main analysis.
+            Use the same JSON response format as in the main analysis, including all detailed fix instruction fields (fixInstructions, searchPattern, replacePattern, correctedCode, implementationGuide, estimatedEffort, cveScore) for each issue.
             
             Code chunk to analyze:
             %s
