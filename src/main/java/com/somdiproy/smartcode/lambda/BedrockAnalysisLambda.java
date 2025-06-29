@@ -19,14 +19,18 @@ import software.amazon.awssdk.services.bedrockruntime.model.InvokeModelRequest;
 import software.amazon.awssdk.services.bedrockruntime.model.InvokeModelResponse;
 
 import java.util.*;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.TimeUnit;
+import software.amazon.awssdk.core.client.config.ClientOverrideConfiguration;
+import software.amazon.awssdk.core.retry.RetryPolicy;
+import java.time.Duration;
 
 public class BedrockAnalysisLambda implements RequestHandler<SQSEvent, Void> {
     
     private static final String TABLE_NAME = System.getenv("DYNAMODB_TABLE_NAME");
     private static final String BUCKET_NAME = System.getenv("S3_BUCKET_NAME");
     private static final String MODEL_ID = System.getenv("BEDROCK_MODEL_ID");
-    private static final int MAX_CHUNK_SIZE = 50000; // characters
+    private static final int MAX_CHUNK_SIZE = 30000; // Reduced chunk size
     private static final int MAX_RETRIES = Integer.parseInt(System.getenv().getOrDefault("MAX_RETRIES", "5"));
     private static final int BASE_RETRY_DELAY = Integer.parseInt(System.getenv().getOrDefault("BASE_RETRY_DELAY", "20000"));
     private static final int CHUNK_DELAY_MS = Integer.parseInt(System.getenv().getOrDefault("CHUNK_PROCESSING_DELAY", "25000"));
@@ -48,13 +52,41 @@ public class BedrockAnalysisLambda implements RequestHandler<SQSEvent, Void> {
     private final AmazonS3 s3Client;
     private final ObjectMapper objectMapper;
     
+    private static final Queue<Long> requestQueue = new ConcurrentLinkedQueue<>();
+    private static final int MAX_QUEUE_SIZE = 10;
+    private static final long QUEUE_WINDOW_MS = 300000; // 5 minutes
+
+    private void cleanRequestQueue() {
+        long cutoffTime = System.currentTimeMillis() - QUEUE_WINDOW_MS;
+        requestQueue.removeIf(time -> time < cutoffTime);
+    }
+
+    private long calculateQueueDelay(Context context) {
+        cleanRequestQueue();
+        
+        if (requestQueue.size() >= MAX_QUEUE_SIZE) {
+            context.getLogger().log("Request queue is full, need extended delay");
+            return 300000; // 5 minutes if queue is full
+        }
+        
+        // Calculate delay based on queue size
+        return MIN_REQUEST_INTERVAL_MS * (1 + requestQueue.size() / 2);
+    }
+    
     public BedrockAnalysisLambda() {
         // Initialize clients with proper error handling
         try {
-            this.bedrockClient = BedrockRuntimeClient.builder()
-                    .region(Region.US_EAST_1)
-                    .credentialsProvider(DefaultCredentialsProvider.create())
-                    .build();
+        	this.bedrockClient = BedrockRuntimeClient.builder()
+        	        .region(Region.US_EAST_1)
+        	        .credentialsProvider(DefaultCredentialsProvider.create())
+        	        .overrideConfiguration(ClientOverrideConfiguration.builder()
+        	                .apiCallTimeout(Duration.ofMinutes(5))
+        	                .apiCallAttemptTimeout(Duration.ofMinutes(2))
+        	                .retryPolicy(RetryPolicy.builder()
+        	                        .numRetries(0) // We handle retries ourselves
+        	                        .build())
+        	                .build())
+        	        .build();
             
             this.dynamoDBClient = AmazonDynamoDBClientBuilder.standard().build();
             this.dynamoDB = new DynamoDB(dynamoDBClient);
@@ -242,16 +274,21 @@ public class BedrockAnalysisLambda implements RequestHandler<SQSEvent, Void> {
     private String invokeBedrockWithRetry(String prompt, Context context) throws Exception {
        
     	checkCircuitBreaker(context);
-        synchronized (requestLock) {
-            long currentTime = System.currentTimeMillis();
-            long timeSinceLastRequest = currentTime - lastRequestTime;
-            if (timeSinceLastRequest < MIN_REQUEST_INTERVAL_MS) {
-                long waitTime = MIN_REQUEST_INTERVAL_MS - timeSinceLastRequest;
-                context.getLogger().log("Throttling request, waiting " + waitTime + "ms to respect rate limits");
-                Thread.sleep(waitTime);
-            }
-            lastRequestTime = System.currentTimeMillis();
-        }
+    	synchronized (requestLock) {
+    	    long queueDelay = calculateQueueDelay(context);
+    	    long currentTime = System.currentTimeMillis();
+    	    long timeSinceLastRequest = currentTime - lastRequestTime;
+    	    long requiredDelay = Math.max(MIN_REQUEST_INTERVAL_MS, queueDelay);
+    	    
+    	    if (timeSinceLastRequest < requiredDelay) {
+    	        long waitTime = requiredDelay - timeSinceLastRequest;
+    	        context.getLogger().log("Throttling request, waiting " + waitTime + "ms (queue size: " + requestQueue.size() + ")");
+    	        Thread.sleep(waitTime);
+    	    }
+    	    
+    	    lastRequestTime = System.currentTimeMillis();
+    	    requestQueue.offer(lastRequestTime);
+    	}
         
         int retryDelay = BASE_RETRY_DELAY;
         
@@ -318,6 +355,17 @@ public class BedrockAnalysisLambda implements RequestHandler<SQSEvent, Void> {
                 
             } catch (Exception e) {
                 context.getLogger().log("Bedrock invocation failed (attempt " + (attempt + 1) + "): " + e.getMessage());
+                
+                // Check if it's a throttling error
+                boolean isThrottlingError = e.getMessage() != null && 
+                    (e.getMessage().contains("429") || 
+                     e.getMessage().contains("Too many requests") ||
+                     e.getMessage().contains("ThrottlingException"));
+                
+                if (isThrottlingError) {
+                    context.getLogger().log("Detected throttling error, using extended backoff");
+                    retryDelay = Math.max(retryDelay, 120000); // At least 2 minutes for throttling
+                }
                 
                 if (attempt < MAX_RETRIES - 1) {
                     // Add jitter to prevent thundering herd
