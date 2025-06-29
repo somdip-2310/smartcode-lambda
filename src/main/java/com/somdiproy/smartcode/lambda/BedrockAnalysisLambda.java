@@ -30,6 +30,16 @@ public class BedrockAnalysisLambda implements RequestHandler<SQSEvent, Void> {
     private static final int MAX_RETRIES = Integer.parseInt(System.getenv().getOrDefault("MAX_RETRIES", "5"));
     private static final int BASE_RETRY_DELAY = Integer.parseInt(System.getenv().getOrDefault("BASE_RETRY_DELAY", "20000"));
     private static final int CHUNK_DELAY_MS = Integer.parseInt(System.getenv().getOrDefault("CHUNK_PROCESSING_DELAY", "25000"));
+    private static final long MIN_REQUEST_INTERVAL_MS = 30000; // 30 seconds between requests
+    private static volatile long lastRequestTime = 0;
+    private static final Object requestLock = new Object();
+ // Circuit breaker configuration
+    private static final int CIRCUIT_BREAKER_THRESHOLD = 3;
+    private static final long CIRCUIT_BREAKER_TIMEOUT_MS = 300000; // 5 minutes
+    private static volatile int consecutiveFailures = 0;
+    private static volatile long circuitBreakerOpenTime = 0;
+    private static final Object circuitBreakerLock = new Object();
+    
     
     private final BedrockRuntimeClient bedrockClient;
     private final AmazonDynamoDB dynamoDBClient;
@@ -57,6 +67,38 @@ public class BedrockAnalysisLambda implements RequestHandler<SQSEvent, Void> {
             this.objectMapper = new ObjectMapper();
         } catch (Exception e) {
             throw new RuntimeException("Failed to initialize Lambda clients", e);
+        }
+    }
+    
+    private void checkCircuitBreaker(Context context) throws Exception {
+        synchronized (circuitBreakerLock) {
+            if (consecutiveFailures >= CIRCUIT_BREAKER_THRESHOLD) {
+                long timeSinceOpen = System.currentTimeMillis() - circuitBreakerOpenTime;
+                if (timeSinceOpen < CIRCUIT_BREAKER_TIMEOUT_MS) {
+                    long remainingTime = CIRCUIT_BREAKER_TIMEOUT_MS - timeSinceOpen;
+                    context.getLogger().log("Circuit breaker is OPEN. Remaining cooldown: " + remainingTime + "ms");
+                    throw new RuntimeException("Circuit breaker is OPEN. Too many consecutive failures. Waiting for cooldown period.");
+                } else {
+                    context.getLogger().log("Circuit breaker cooldown complete, resetting failure count");
+                    consecutiveFailures = 0;
+                    circuitBreakerOpenTime = 0;
+                }
+            }
+        }
+    }
+
+    private void recordSuccess() {
+        synchronized (circuitBreakerLock) {
+            consecutiveFailures = 0;
+        }
+    }
+
+    private void recordFailure() {
+        synchronized (circuitBreakerLock) {
+            consecutiveFailures++;
+            if (consecutiveFailures == CIRCUIT_BREAKER_THRESHOLD) {
+                circuitBreakerOpenTime = System.currentTimeMillis();
+            }
         }
     }
     
@@ -153,15 +195,36 @@ public class BedrockAnalysisLambda implements RequestHandler<SQSEvent, Void> {
         for (int i = 0; i < chunks.size(); i++) {
             context.getLogger().log("Processing chunk " + (i + 1) + " of " + chunks.size());
             
-            String chunkPrompt = buildChunkAnalysisPrompt(chunks.get(i), language, i + 1, chunks.size());
-            String result = invokeBedrockWithRetry(chunkPrompt, context);
+            // Adaptive delay based on chunk number and previous failures
+            if (i > 0) {
+                // Increase delay for later chunks (every 3 chunks, add another base delay)
+                long adaptiveDelay = CHUNK_DELAY_MS * (1 + i / 3);
+                // Add some randomness to avoid patterns
+                Random random = new Random();
+                long jitter = random.nextInt(10000); // 0-10 seconds jitter
+                long totalDelay = adaptiveDelay + jitter;
+                
+                context.getLogger().log("Waiting " + totalDelay + "ms before processing next chunk (adaptive: " + adaptiveDelay + "ms, jitter: " + jitter + "ms)");
+                Thread.sleep(totalDelay);
+            }
             
-            Map<String, Object> chunkResult = parseAnalysisResult(result, context);
-            chunkResults.add(chunkResult);
-            
-            // Delay between chunks to avoid throttling
-            if (i < chunks.size() - 1) {
-                Thread.sleep(CHUNK_DELAY_MS);
+            try {
+                String chunkPrompt = buildChunkAnalysisPrompt(chunks.get(i), language, i + 1, chunks.size());
+                String result = invokeBedrockWithRetry(chunkPrompt, context);
+                
+                Map<String, Object> chunkResult = parseAnalysisResult(result, context);
+                chunkResults.add(chunkResult);
+            } catch (Exception e) {
+                context.getLogger().log("Failed to process chunk " + (i + 1) + ": " + e.getMessage());
+                // Store partial results even if one chunk fails
+                if (chunkResults.size() > 0) {
+                    Map<String, Object> partialResult = mergeChunkResults(chunkResults, code, metadata);
+                    partialResult.put("partial", true);
+                    partialResult.put("processedChunks", i);
+                    partialResult.put("totalChunks", chunks.size());
+                    updateAnalysisStatus(analysisId, "PARTIAL", "Partial analysis completed", partialResult, metadata);
+                }
+                throw e;
             }
         }
         
@@ -177,6 +240,19 @@ public class BedrockAnalysisLambda implements RequestHandler<SQSEvent, Void> {
     }
     
     private String invokeBedrockWithRetry(String prompt, Context context) throws Exception {
+       
+    	checkCircuitBreaker(context);
+        synchronized (requestLock) {
+            long currentTime = System.currentTimeMillis();
+            long timeSinceLastRequest = currentTime - lastRequestTime;
+            if (timeSinceLastRequest < MIN_REQUEST_INTERVAL_MS) {
+                long waitTime = MIN_REQUEST_INTERVAL_MS - timeSinceLastRequest;
+                context.getLogger().log("Throttling request, waiting " + waitTime + "ms to respect rate limits");
+                Thread.sleep(waitTime);
+            }
+            lastRequestTime = System.currentTimeMillis();
+        }
+        
         int retryDelay = BASE_RETRY_DELAY;
         
         for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
@@ -231,6 +307,7 @@ public class BedrockAnalysisLambda implements RequestHandler<SQSEvent, Void> {
                         if (content != null && !content.isEmpty()) {
                             Map<String, Object> firstContent = content.get(0);
                             if (firstContent != null && firstContent.containsKey("text")) {
+                                recordSuccess(); // Record successful invocation
                                 return (String) firstContent.get("text");
                             }
                         }
@@ -243,14 +320,23 @@ public class BedrockAnalysisLambda implements RequestHandler<SQSEvent, Void> {
                 context.getLogger().log("Bedrock invocation failed (attempt " + (attempt + 1) + "): " + e.getMessage());
                 
                 if (attempt < MAX_RETRIES - 1) {
-                    Thread.sleep(retryDelay);
-                    retryDelay *= 2; // Exponential backoff
+                    // Add jitter to prevent thundering herd
+                    Random random = new Random();
+                    int jitter = random.nextInt(5000) + 5000; // 5-10 seconds jitter
+                    long actualDelay = retryDelay + jitter;
+                    context.getLogger().log("Waiting " + actualDelay + "ms before retry (base: " + retryDelay + "ms, jitter: " + jitter + "ms)");
+                    Thread.sleep(actualDelay);
+                    
+                    // Use configurable multiplier or default to 1.5
+                    double multiplier = Double.parseDouble(System.getenv().getOrDefault("EXPONENTIAL_BACKOFF_MULTIPLIER", "1.5"));
+                    retryDelay = (int)(retryDelay * multiplier);
                 } else {
                     throw e;
                 }
             }
         }
         
+        recordFailure(); // Record failure for circuit breaker
         throw new RuntimeException("Failed to invoke Bedrock after " + MAX_RETRIES + " attempts");
     }
     
